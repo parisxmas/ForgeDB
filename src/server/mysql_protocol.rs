@@ -1,6 +1,6 @@
 use std::io::{self, BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use crate::database::Database;
@@ -80,7 +80,7 @@ impl MysqlServer {
         let db = Database::open(&self.db_path)
             .or_else(|_| Database::new(&self.db_path))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{}", e)))?;
-        let db = Arc::new(Mutex::new(db));
+        let db = Arc::new(db);
 
         let connection_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
 
@@ -134,13 +134,13 @@ impl MysqlServer {
 struct ConnectionHandler {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
     connection_id: u32,
     seq_id: u8,
 }
 
 impl ConnectionHandler {
-    fn new_shared(stream: TcpStream, db: Arc<Mutex<Database>>, connection_id: u32) -> io::Result<Self> {
+    fn new_shared(stream: TcpStream, db: Arc<Database>, connection_id: u32) -> io::Result<Self> {
         let reader_stream = stream.try_clone()?;
         Ok(Self {
             reader: BufReader::with_capacity(8192, reader_stream),
@@ -580,7 +580,7 @@ impl ConnectionHandler {
         // REPLACE INTO -> convert to INSERT and forward
         if upper.starts_with("REPLACE ") {
             let insert_sql = trimmed.replacen("REPLACE", "INSERT", 1);
-            let __result = self.db.lock().unwrap().execute_sql(&insert_sql);
+            let __result = self.db.execute_sql(&insert_sql);
                 match __result {
                 Ok(result) => {
                     let ok = Self::ok_packet(result.rows_affected as u64, 0);
@@ -641,7 +641,7 @@ impl ConnectionHandler {
                 let table_part = &trimmed[pos + 5..].trim().trim_end_matches(';');
                 let table_name = table_part.split_whitespace().next().unwrap_or("").trim_matches('`');
                 let show_sql = format!("SHOW COLUMNS FROM {}", table_name);
-                let __result = self.db.lock().unwrap().execute_sql(&show_sql);
+                let __result = self.db.execute_sql(&show_sql);
                 match __result {
                     Ok(result) => {
                         self.send_result_set_with_types(&result.columns, &result.rows)?;
@@ -657,7 +657,7 @@ impl ConnectionHandler {
         // SHOW TABLES LIKE
         if upper.starts_with("SHOW TABLES LIKE") {
             // Forward SHOW TABLES and filter
-            let __result = self.db.lock().unwrap().execute_sql("SHOW TABLES");
+            let __result = self.db.execute_sql("SHOW TABLES");
                 match __result {
                 Ok(result) => {
                     self.send_result_set_with_types(&result.columns, &result.rows)?;
@@ -807,11 +807,11 @@ impl ConnectionHandler {
             let payload = match self.read_packet() {
                 Ok(p) => p,
                 Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    let _ = self.db.lock().unwrap().catalog.persist();
+                    
                     return Ok(());
                 }
                 Err(e) => {
-                    let _ = self.db.lock().unwrap().catalog.persist();
+                    
                     return Err(e);
                 }
             };
@@ -827,7 +827,7 @@ impl ConnectionHandler {
             match cmd {
                 // COM_QUIT
                 0x01 => {
-                    let _ = self.db.lock().unwrap().catalog.persist();
+                    
                     return Ok(());
                 }
 
@@ -929,7 +929,7 @@ impl ConnectionHandler {
         let rewritten = Self::rewrite_sql(sql);
 
         // Forward to database engine
-        let __result = self.db.lock().unwrap().execute_sql(&rewritten);
+        let __result = self.db.execute_sql(&rewritten);
                 match __result {
             Ok(result) => {
                 if result.columns.is_empty() {

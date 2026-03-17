@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, RwLock};
 
 use crate::catalog::Catalog;
 use crate::error::Result;
@@ -12,14 +14,19 @@ use crate::storage::{BufferPoolManager, DiskManager};
 use crate::tuple::types::Value;
 use crate::txn::TransactionManager;
 
-/// Top-level database handle.
+/// Top-level database handle with interior mutability for concurrent access.
+///
+/// SQL parsing and query planning run lock-free in parallel across all cores.
+/// The catalog uses a RwLock so concurrent SELECTs share read access.
+/// Data access (BPM, indexes) uses fine-grained Mutexes held only during
+/// the execution phase.
 pub struct Database {
-    pub bpm: BufferPoolManager,
-    pub catalog: Catalog,
-    pub txn_manager: TransactionManager,
-    pub indexes: Vec<(String, BTreeIndex)>,
-    pub clustered_indexes: std::collections::HashMap<String, ClusteredIndex>,
-    pub auto_increment_counters: std::collections::HashMap<String, i64>,
+    bpm: Mutex<BufferPoolManager>,
+    catalog: RwLock<Catalog>,
+    txn_manager: Mutex<TransactionManager>,
+    indexes: RwLock<Vec<(String, BTreeIndex)>>,
+    clustered_indexes: RwLock<HashMap<String, ClusteredIndex>>,
+    auto_increment_counters: Mutex<HashMap<String, i64>>,
     #[allow(dead_code)]
     db_path: PathBuf,
 }
@@ -40,12 +47,12 @@ impl Database {
         let txn_manager = TransactionManager::new(wal_file.to_str().unwrap())?;
 
         Ok(Self {
-            bpm,
-            catalog,
-            txn_manager,
-            indexes: Vec::new(),
-            clustered_indexes: std::collections::HashMap::new(),
-            auto_increment_counters: std::collections::HashMap::new(),
+            bpm: Mutex::new(bpm),
+            catalog: RwLock::new(catalog),
+            txn_manager: Mutex::new(txn_manager),
+            indexes: RwLock::new(Vec::new()),
+            clustered_indexes: RwLock::new(HashMap::new()),
+            auto_increment_counters: Mutex::new(HashMap::new()),
             db_path,
         })
     }
@@ -66,51 +73,65 @@ impl Database {
         txn_manager.recover(&mut bpm)?;
 
         Ok(Self {
-            bpm,
-            catalog,
-            txn_manager,
-            indexes: Vec::new(),
-            clustered_indexes: std::collections::HashMap::new(),
-            auto_increment_counters: std::collections::HashMap::new(),
+            bpm: Mutex::new(bpm),
+            catalog: RwLock::new(catalog),
+            txn_manager: Mutex::new(txn_manager),
+            indexes: RwLock::new(Vec::new()),
+            clustered_indexes: RwLock::new(HashMap::new()),
+            auto_increment_counters: Mutex::new(HashMap::new()),
             db_path,
         })
     }
 
     /// Parse, plan, and execute a SQL statement.
-    pub fn execute_sql(&mut self, sql_text: &str) -> Result<ExecuteResult> {
+    ///
+    /// Takes `&self` — multiple threads can call this concurrently.
+    /// Parsing and planning run lock-free on all cores.
+    /// Execution acquires fine-grained locks only when needed.
+    pub fn execute_sql(&self, sql_text: &str) -> Result<ExecuteResult> {
+        // Phase 1: Parse — no locks, runs on any core
         let stmt = sql::parse(sql_text)?;
 
-        // Handle statements that bypass planner
+        // Phase 2: Handle metadata queries with read lock only
         if let Some(result) = self.try_handle_directly(&stmt)? {
             return Ok(result);
         }
 
-        // Plan
+        // Phase 3: Plan — read locks on catalog + indexes (concurrent with other SELECTs)
         let plan = {
-            let planner = Planner::new(&self.catalog, &self.indexes);
+            let catalog = self.catalog.read().unwrap();
+            let indexes = self.indexes.read().unwrap();
+            let planner = Planner::new(&catalog, &indexes);
             planner.plan(stmt)?
-        };
+        }; // read locks released here
 
-        // Execute
+        // Phase 4: Execute — acquire write locks for data modification
+        let mut bpm = self.bpm.lock().unwrap();
+        let mut catalog = self.catalog.write().unwrap();
+        let mut indexes = self.indexes.write().unwrap();
+        let mut clustered = self.clustered_indexes.write().unwrap();
+        let mut auto_inc = self.auto_increment_counters.lock().unwrap();
+
         let mut ctx = ExecutorContext {
-            bpm: &mut self.bpm,
-            catalog: &mut self.catalog,
-            indexes: &mut self.indexes,
-            clustered_indexes: &mut self.clustered_indexes,
-            auto_increment_counters: &mut self.auto_increment_counters,
+            bpm: &mut bpm,
+            catalog: &mut catalog,
+            indexes: &mut indexes,
+            clustered_indexes: &mut clustered,
+            auto_increment_counters: &mut auto_inc,
         };
         let result = executor::execute(plan, &mut ctx)?;
 
-        self.catalog.persist()?;
+        catalog.persist()?;
 
         Ok(result)
     }
 
-    /// Handle statements that don't need the planner.
-    fn try_handle_directly(&mut self, stmt: &Statement) -> Result<Option<ExecuteResult>> {
+    /// Handle metadata/session statements with minimal locking.
+    fn try_handle_directly(&self, stmt: &Statement) -> Result<Option<ExecuteResult>> {
         match stmt {
             Statement::ShowTables => {
-                let tables = self.catalog.list_tables();
+                let catalog = self.catalog.read().unwrap();
+                let tables = catalog.list_tables();
                 let mut rows: Vec<Vec<Value>> = tables
                     .iter()
                     .map(|t| vec![Value::Varchar(t.name.clone())])
@@ -119,12 +140,14 @@ impl Database {
                 Ok(Some(ExecuteResult {
                     columns: vec!["Tables_in_forgedb".to_string()],
                     rows,
-                    rows_affected: 0, last_insert_id: 0,
+                    rows_affected: 0,
+                    last_insert_id: 0,
                     message: String::new(),
                 }))
             }
             Statement::ShowColumns { table_name } => {
-                let info = self.catalog.get_table(table_name).ok_or_else(|| {
+                let catalog = self.catalog.read().unwrap();
+                let info = catalog.get_table(table_name).ok_or_else(|| {
                     crate::error::ForgeError::Execution(format!(
                         "table '{}' not found",
                         table_name
@@ -139,43 +162,33 @@ impl Database {
                             Value::Varchar(c.name.clone()),
                             Value::Varchar(format!("{:?}", c.data_type)),
                             Value::Varchar(if c.nullable { "YES" } else { "NO" }.into()),
-                            Value::Varchar(
-                                if c.is_primary_key { "PRI" } else { "" }.into(),
-                            ),
+                            Value::Varchar(if c.is_primary_key { "PRI" } else { "" }.into()),
                             Value::Null,
                             Value::Varchar(
-                                if c.auto_increment {
-                                    "auto_increment"
-                                } else {
-                                    ""
-                                }
-                                .into(),
+                                if c.auto_increment { "auto_increment" } else { "" }.into(),
                             ),
                         ]
                     })
                     .collect();
                 Ok(Some(ExecuteResult {
                     columns: vec![
-                        "Field".into(),
-                        "Type".into(),
-                        "Null".into(),
-                        "Key".into(),
-                        "Default".into(),
-                        "Extra".into(),
+                        "Field".into(), "Type".into(), "Null".into(),
+                        "Key".into(), "Default".into(), "Extra".into(),
                     ],
                     rows,
-                    rows_affected: 0, last_insert_id: 0,
+                    rows_affected: 0,
+                    last_insert_id: 0,
                     message: String::new(),
                 }))
             }
             Statement::DescribeTable { table_name } => {
-                // Same as SHOW COLUMNS
                 self.try_handle_directly(&Statement::ShowColumns {
                     table_name: table_name.clone(),
                 })
             }
             Statement::ShowCreateTable { table_name } => {
-                let info = self.catalog.get_table(table_name).ok_or_else(|| {
+                let catalog = self.catalog.read().unwrap();
+                let info = catalog.get_table(table_name).ok_or_else(|| {
                     crate::error::ForgeError::Execution(format!(
                         "table '{}' not found",
                         table_name
@@ -191,11 +204,7 @@ impl Database {
                         col.name,
                         col.data_type,
                         if col.nullable { " NULL" } else { " NOT NULL" },
-                        if col.auto_increment {
-                            " AUTO_INCREMENT"
-                        } else {
-                            ""
-                        },
+                        if col.auto_increment { " AUTO_INCREMENT" } else { "" },
                     ));
                 }
                 ddl.push_str("\n)");
@@ -205,7 +214,8 @@ impl Database {
                         Value::Varchar(info.name.clone()),
                         Value::Varchar(ddl),
                     ]],
-                    rows_affected: 0, last_insert_id: 0,
+                    rows_affected: 0,
+                    last_insert_id: 0,
                     message: String::new(),
                 }))
             }
@@ -213,7 +223,8 @@ impl Database {
                 Ok(Some(ExecuteResult {
                     rows: vec![],
                     columns: vec![],
-                    rows_affected: 0, last_insert_id: 0,
+                    rows_affected: 0,
+                    last_insert_id: 0,
                     message: "OK".into(),
                 }))
             }
@@ -221,7 +232,8 @@ impl Database {
                 Ok(Some(ExecuteResult {
                     rows: vec![],
                     columns: vec![],
-                    rows_affected: 0, last_insert_id: 0,
+                    rows_affected: 0,
+                    last_insert_id: 0,
                     message: "OK".into(),
                 }))
             }
@@ -230,9 +242,11 @@ impl Database {
     }
 
     /// Shut down the database cleanly.
-    pub fn shutdown(&mut self) -> Result<()> {
-        self.catalog.persist()?;
-        self.bpm.flush_all()?;
+    pub fn shutdown(&self) -> Result<()> {
+        let catalog = self.catalog.read().unwrap();
+        catalog.persist()?;
+        let mut bpm = self.bpm.lock().unwrap();
+        bpm.flush_all()?;
         Ok(())
     }
 }
