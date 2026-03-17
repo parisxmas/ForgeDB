@@ -677,6 +677,22 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
         sp::Expr::Exists { .. } => {
             Ok(Expr::Literal(LiteralValue::Boolean(true)))
         }
+        sp::Expr::RLike { expr, pattern, negated, .. } => {
+            // REGEXP/RLIKE: convert to LIKE with % wildcards as a simplification
+            let e = convert_expr(expr)?;
+            let p = convert_expr(pattern)?;
+            if *negated {
+                Ok(Expr::NotLike {
+                    expr: Box::new(e),
+                    pattern: Box::new(p),
+                })
+            } else {
+                Ok(Expr::Like {
+                    expr: Box::new(e),
+                    pattern: Box::new(p),
+                })
+            }
+        }
         _ => Err(ForgeError::Parse(format!(
             "unsupported expression: {:?}",
             expr

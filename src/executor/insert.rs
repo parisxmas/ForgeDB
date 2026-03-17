@@ -31,6 +31,7 @@ pub fn execute_insert(
     let empty_schema = Schema::new(vec![]);
 
     let mut count = 0;
+    let mut last_insert_id: u64 = 0;
 
     for row_exprs in values {
         let mut eval_values: Vec<Value> = Vec::new();
@@ -51,6 +52,7 @@ pub fn execute_insert(
                 let counter_key = format!("{}.{}", table_name.to_lowercase(), col.name.to_lowercase());
                 let next_val = auto_increment_counters.entry(counter_key).or_insert(0);
                 *next_val += 1;
+                last_insert_id = *next_val as u64;
                 match col.data_type {
                     DataType::BigInt => final_values[i] = Value::BigInt(*next_val),
                     _ => final_values[i] = Value::Integer(*next_val as i32),
@@ -97,6 +99,7 @@ pub fn execute_insert(
         rows: vec![],
         columns: vec![],
         rows_affected: count,
+        last_insert_id,
         message: format!("({} row(s) affected)", count),
     })
 }

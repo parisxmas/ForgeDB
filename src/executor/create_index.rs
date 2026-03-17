@@ -42,7 +42,7 @@ pub fn execute_create_index(
         return Ok(ExecuteResult {
             rows: vec![],
             columns: vec![],
-            rows_affected: 0,
+            rows_affected: 0, last_insert_id: 0,
             message: format!("Index already exists on {}.{}", table_name, col_name),
         });
     }
@@ -66,7 +66,7 @@ pub fn execute_create_index(
     Ok(ExecuteResult {
         rows: vec![],
         columns: vec![],
-        rows_affected: count as usize,
+        rows_affected: count as usize, last_insert_id: 0,
         message: format!(
             "Index '{}' created on {}.{} ({} entries)",
             index_name, table_name, col_name, count

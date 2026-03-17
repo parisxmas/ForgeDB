@@ -1,5 +1,7 @@
-use std::io::{self, BufRead, BufReader, BufWriter, Read as IoRead, Write as IoWrite};
+use std::io::{self, BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::database::Database;
 use crate::tuple::types::Value;
@@ -69,48 +71,51 @@ impl MysqlServer {
     }
 
     /// Start listening for connections. Blocks indefinitely.
-    /// Handles one connection at a time (single-threaded).
+    /// Spawns a thread per connection, sharing a single Database via Arc<Mutex>.
     pub fn start(&self) -> io::Result<()> {
         let listener = TcpListener::bind(&self.bind_addr)?;
         println!("Server listening on {}", self.bind_addr);
 
-        let mut connection_id: u32 = 1;
+        // Single shared database instance
+        let db = Database::open(&self.db_path)
+            .or_else(|_| Database::new(&self.db_path))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{}", e)))?;
+        let db = Arc::new(Mutex::new(db));
+
+        let connection_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let _ = stream.set_nodelay(true); // Disable Nagle's algorithm
+                    let _ = stream.set_nodelay(true);
+                    let conn_id = connection_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let db = Arc::clone(&db);
                     let peer = stream
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
-                    println!("New connection from {} (id={})", peer, connection_id);
+                    println!("New connection from {} (id={})", peer, conn_id);
 
-                    let db = match Database::new(&self.db_path) {
-                        Ok(db) => db,
-                        Err(e) => {
-                            eprintln!("Failed to open database: {}", e);
-                            connection_id = connection_id.wrapping_add(1);
-                            continue;
+                    thread::spawn(move || {
+                        let mut handler = match ConnectionHandler::new_shared(stream, db, conn_id) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                eprintln!("Connection {} handler error: {}", conn_id, e);
+                                return;
+                            }
+                        };
+
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handler.run()
+                        }));
+                        match &result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => eprintln!("Connection {} ended: {}", conn_id, e),
+                            Err(_) => eprintln!("Connection {} panicked (recovered)", conn_id),
                         }
-                    };
 
-                    let mut handler = match ConnectionHandler::new(stream, db, connection_id) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            eprintln!("Failed to create handler: {}", e);
-                            connection_id = connection_id.wrapping_add(1);
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = handler.run() {
-                        // Connection-level errors are normal (client disconnect, etc.)
-                        eprintln!("Connection {} ended: {}", connection_id, e);
-                    }
-
-                    println!("Connection {} closed", connection_id);
-                    connection_id = connection_id.wrapping_add(1);
+                        println!("Connection {} closed", conn_id);
+                    });
                 }
                 Err(e) => {
                     eprintln!("Accept error: {}", e);
@@ -129,13 +134,13 @@ impl MysqlServer {
 struct ConnectionHandler {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
-    db: Database,
+    db: Arc<Mutex<Database>>,
     connection_id: u32,
     seq_id: u8,
 }
 
 impl ConnectionHandler {
-    fn new(stream: TcpStream, db: Database, connection_id: u32) -> io::Result<Self> {
+    fn new_shared(stream: TcpStream, db: Arc<Mutex<Database>>, connection_id: u32) -> io::Result<Self> {
         let reader_stream = stream.try_clone()?;
         Ok(Self {
             reader: BufReader::with_capacity(8192, reader_stream),
@@ -575,7 +580,8 @@ impl ConnectionHandler {
         // REPLACE INTO -> convert to INSERT and forward
         if upper.starts_with("REPLACE ") {
             let insert_sql = trimmed.replacen("REPLACE", "INSERT", 1);
-            match self.db.execute_sql(&insert_sql) {
+            let __result = self.db.lock().unwrap().execute_sql(&insert_sql);
+                match __result {
                 Ok(result) => {
                     let ok = Self::ok_packet(result.rows_affected as u64, 0);
                     self.write_packet(&ok)?;
@@ -635,7 +641,8 @@ impl ConnectionHandler {
                 let table_part = &trimmed[pos + 5..].trim().trim_end_matches(';');
                 let table_name = table_part.split_whitespace().next().unwrap_or("").trim_matches('`');
                 let show_sql = format!("SHOW COLUMNS FROM {}", table_name);
-                match self.db.execute_sql(&show_sql) {
+                let __result = self.db.lock().unwrap().execute_sql(&show_sql);
+                match __result {
                     Ok(result) => {
                         self.send_result_set_with_types(&result.columns, &result.rows)?;
                     }
@@ -650,7 +657,8 @@ impl ConnectionHandler {
         // SHOW TABLES LIKE
         if upper.starts_with("SHOW TABLES LIKE") {
             // Forward SHOW TABLES and filter
-            match self.db.execute_sql("SHOW TABLES") {
+            let __result = self.db.lock().unwrap().execute_sql("SHOW TABLES");
+                match __result {
                 Ok(result) => {
                     self.send_result_set_with_types(&result.columns, &result.rows)?;
                 }
@@ -799,9 +807,13 @@ impl ConnectionHandler {
             let payload = match self.read_packet() {
                 Ok(p) => p,
                 Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    let _ = self.db.lock().unwrap().catalog.persist();
                     return Ok(());
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let _ = self.db.lock().unwrap().catalog.persist();
+                    return Err(e);
+                }
             };
 
             // Response packets start at seq = client_seq + 1
@@ -815,6 +827,7 @@ impl ConnectionHandler {
             match cmd {
                 // COM_QUIT
                 0x01 => {
+                    let _ = self.db.lock().unwrap().catalog.persist();
                     return Ok(());
                 }
 
@@ -916,10 +929,11 @@ impl ConnectionHandler {
         let rewritten = Self::rewrite_sql(sql);
 
         // Forward to database engine
-        match self.db.execute_sql(&rewritten) {
+        let __result = self.db.lock().unwrap().execute_sql(&rewritten);
+                match __result {
             Ok(result) => {
                 if result.columns.is_empty() {
-                    let ok = Self::ok_packet(result.rows_affected as u64, 0);
+                    let ok = Self::ok_packet(result.rows_affected as u64, result.last_insert_id);
                     self.write_packet(&ok)?;
                     self.flush()?;
                 } else {

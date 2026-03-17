@@ -499,13 +499,12 @@ mod tests {
 
     #[test]
     fn test_leaf_split() {
-        // A leaf page with 5-byte integer sort keys fits roughly:
-        //   (4096 - 12) / (2 + 5 + 4 + 2) = 4084 / 13 = ~314 entries
-        // So inserting 400+ will force at least one split.
+        // With 16KB pages, a leaf fits ~1259 entries (5-byte keys).
+        // Insert 1500 to force at least one split.
         let (mut bpm, _dir) = make_bpm(128);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
-        let n = 400;
+        let n = 1500;
         for i in 0..n {
             let key = Value::Integer(i);
             let rid = RID { page_id: PageId(i as u32), slot_id: 0 };

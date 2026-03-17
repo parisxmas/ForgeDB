@@ -19,7 +19,7 @@ pub fn execute_drop_table(
     Ok(ExecuteResult {
         rows: vec![],
         columns: vec![],
-        rows_affected: 0,
+        rows_affected: 0, last_insert_id: 0,
         message: format!("Table '{}' dropped.", table_name),
     })
 }

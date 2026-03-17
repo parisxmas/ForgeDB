@@ -119,7 +119,7 @@ impl Database {
                 Ok(Some(ExecuteResult {
                     columns: vec!["Tables_in_forgedb".to_string()],
                     rows,
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: String::new(),
                 }))
             }
@@ -164,7 +164,7 @@ impl Database {
                         "Extra".into(),
                     ],
                     rows,
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: String::new(),
                 }))
             }
@@ -205,7 +205,7 @@ impl Database {
                         Value::Varchar(info.name.clone()),
                         Value::Varchar(ddl),
                     ]],
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: String::new(),
                 }))
             }
@@ -213,7 +213,7 @@ impl Database {
                 Ok(Some(ExecuteResult {
                     rows: vec![],
                     columns: vec![],
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: "OK".into(),
                 }))
             }
@@ -221,7 +221,7 @@ impl Database {
                 Ok(Some(ExecuteResult {
                     rows: vec![],
                     columns: vec![],
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: "OK".into(),
                 }))
             }

@@ -27,6 +27,7 @@ pub struct ExecuteResult {
     pub rows: Vec<Vec<Value>>,
     pub columns: Vec<String>,
     pub rows_affected: usize,
+    pub last_insert_id: u64,
     pub message: String,
 }
 
@@ -39,14 +40,19 @@ pub fn execute(plan: PlanNode, ctx: &mut ExecutorContext) -> Result<ExecuteResul
         } => {
             if table_name.is_empty() {
                 return Ok(ExecuteResult {
-                    rows: vec![], columns: vec![], rows_affected: 0,
+                    rows: vec![], columns: vec![], rows_affected: 0, last_insert_id: 0,
                     message: "OK (table already exists)".into(),
                 });
             }
             let result = create_table::execute_create_table(&table_name, &columns, ctx.bpm, ctx.catalog)?;
-            // Auto-create clustered B+ tree index on PRIMARY KEY columns
+            // Auto-create clustered B+ tree index on PK for fixed-size tables only.
+            // Tables with VARCHAR columns can produce rows exceeding 4KB page size,
+            // so we skip clustered index and use heap file + secondary B-tree instead.
             let has_pk = columns.iter().any(|c| c.is_primary_key);
-            if has_pk {
+            let has_varchar = columns.iter().any(|c| {
+                matches!(c.data_type, crate::tuple::types::DataType::Varchar(_))
+            });
+            if has_pk && !has_varchar {
                 let pk_col_idx = columns.iter().position(|c| c.is_primary_key).unwrap();
                 let cidx = ClusteredIndex::create(ctx.bpm, pk_col_idx)
                     .map_err(|e| crate::error::ForgeError::Execution(format!("failed to create clustered index: {}", e)))?;
@@ -72,7 +78,7 @@ pub fn execute(plan: PlanNode, ctx: &mut ExecutorContext) -> Result<ExecuteResul
         PlanNode::DropTable { table_name } => {
             if table_name.is_empty() {
                 return Ok(ExecuteResult {
-                    rows: vec![], columns: vec![], rows_affected: 0,
+                    rows: vec![], columns: vec![], rows_affected: 0, last_insert_id: 0,
                     message: "OK (table does not exist)".into(),
                 });
             }
@@ -152,10 +158,10 @@ pub fn execute(plan: PlanNode, ctx: &mut ExecutorContext) -> Result<ExecuteResul
                 let rows_with_rid: Vec<_> = value_rows.into_iter().map(|v| (dummy_rid, v)).collect();
                 if aggregate::has_aggregates(&proj_cols) {
                     let (col_names, result_rows) = aggregate::execute_aggregate(&proj_cols, &rows_with_rid, &schema)?;
-                    return Ok(ExecuteResult { rows: result_rows, columns: col_names, rows_affected: 0, message: String::new() });
+                    return Ok(ExecuteResult { rows: result_rows, columns: col_names, rows_affected: 0, last_insert_id: 0, message: String::new() });
                 }
                 let (col_names, projected_rows) = projection::execute_projection(&proj_cols, &rows_with_rid, &schema)?;
-                return Ok(ExecuteResult { rows: projected_rows, columns: col_names, rows_affected: 0, message: String::new() });
+                return Ok(ExecuteResult { rows: projected_rows, columns: col_names, rows_affected: 0, last_insert_id: 0, message: String::new() });
             }
             // Otherwise sort on result columns
             let mut result = execute(*child, ctx)?;
@@ -172,7 +178,7 @@ pub fn execute(plan: PlanNode, ctx: &mut ExecutorContext) -> Result<ExecuteResul
                 Ok(ExecuteResult {
                     rows: result_rows,
                     columns: col_names,
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: String::new(),
                 })
             } else {
@@ -181,7 +187,7 @@ pub fn execute(plan: PlanNode, ctx: &mut ExecutorContext) -> Result<ExecuteResul
                 Ok(ExecuteResult {
                     rows: projected_rows,
                     columns: col_names,
-                    rows_affected: 0,
+                    rows_affected: 0, last_insert_id: 0,
                     message: String::new(),
                 })
             }
@@ -200,7 +206,7 @@ pub fn execute(plan: PlanNode, ctx: &mut ExecutorContext) -> Result<ExecuteResul
             Ok(ExecuteResult {
                 rows: value_rows,
                 columns: col_names,
-                rows_affected: 0,
+                rows_affected: 0, last_insert_id: 0,
                 message: String::new(),
             })
         }

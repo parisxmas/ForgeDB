@@ -35,8 +35,7 @@ pub fn execute_create_table(
     let page_id = bpm.new_page()?;
     {
         let page = bpm.get_page_mut(page_id);
-        let data: &mut [u8; 4096] = (&mut page.data).try_into().unwrap();
-        heap_page::init(data);
+        heap_page::init(&mut page.data);
     }
     let _ = bpm.unpin_page(page_id, true);
 
@@ -46,7 +45,7 @@ pub fn execute_create_table(
     Ok(ExecuteResult {
         rows: vec![],
         columns: vec![],
-        rows_affected: 0,
+        rows_affected: 0, last_insert_id: 0,
         message: format!("Table '{}' created.", table_name),
     })
 }

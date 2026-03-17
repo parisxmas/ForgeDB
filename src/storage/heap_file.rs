@@ -210,7 +210,7 @@ mod tests {
     fn test_multiple_pages() {
         let (hf, mut bpm, _dir) = setup();
         // Insert enough tuples to force a second page allocation.
-        let big = vec![0xABu8; 500];
+        let big = vec![0xABu8; 2000];
         let mut rids = Vec::new();
         for _ in 0..20 {
             let rid = hf.insert_tuple(&mut bpm, &big).unwrap();

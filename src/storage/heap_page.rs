@@ -325,9 +325,9 @@ mod tests {
         while insert_tuple(&mut page, &big).is_some() {
             count += 1;
         }
-        // We should be able to fit a few ~1000-byte tuples in a 4096-byte page.
+        // We should be able to fit multiple ~1000-byte tuples in a page.
         assert!(count >= 3);
-        assert!(count <= 4);
+        assert!(count <= 16); // 16KB page fits up to ~16 tuples of 1000 bytes
     }
 
     #[test]

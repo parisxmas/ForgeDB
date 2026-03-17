@@ -58,7 +58,7 @@ pub fn execute_delete(
     Ok(ExecuteResult {
         rows: vec![],
         columns: vec![],
-        rows_affected: count,
+        rows_affected: count, last_insert_id: 0,
         message: format!("({} row(s) affected)", count),
     })
 }

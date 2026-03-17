@@ -1,5 +1,5 @@
-/// Page size in bytes (4 KB).
-pub const PAGE_SIZE: usize = 4096;
+/// Page size in bytes (16 KB, matching MySQL/InnoDB).
+pub const PAGE_SIZE: usize = 16384;
 
 /// Invalid page sentinel.
 pub const INVALID_PAGE_ID: u32 = u32::MAX;
