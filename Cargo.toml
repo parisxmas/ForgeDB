@@ -1,0 +1,20 @@
+[package]
+name = "forgedb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqlparser = "0.61"
+thiserror = "2"
+
+[[bin]]
+name = "forgedb-server"
+path = "src/bin/forgedb-server.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"
