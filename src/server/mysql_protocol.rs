@@ -561,6 +561,163 @@ impl ConnectionHandler {
         let trimmed = sql.trim();
         let upper = trimmed.to_uppercase();
 
+        // SHOW DATABASES — DBeaver catalog browser
+        if upper.starts_with("SHOW DATABASES") || upper.starts_with("SHOW SCHEMAS") {
+            let cols = vec!["Database".to_string()];
+            let rows = vec![
+                vec![Value::Varchar("forgedb".to_string())],
+                vec![Value::Varchar("information_schema".to_string())],
+            ];
+            self.send_result_set_with_types(&cols, &rows)?;
+            return Ok(Some(()));
+        }
+
+        // information_schema queries — DBeaver sends many of these
+        if upper.contains("INFORMATION_SCHEMA") {
+            // Tables query
+            if upper.contains("TABLES") && !upper.contains("TABLE_CONSTRAINTS") {
+                let __result = self.db.execute_sql("SHOW TABLES");
+                match __result {
+                    Ok(result) => {
+                        let mut rows = Vec::new();
+                        for r in &result.rows {
+                            if let Some(Value::Varchar(name)) = r.first() {
+                                rows.push(vec![
+                                    Value::Varchar("def".into()),
+                                    Value::Varchar("forgedb".into()),
+                                    Value::Varchar(name.clone()),
+                                    Value::Varchar("BASE TABLE".into()),
+                                    Value::Varchar("InnoDB".into()),
+                                    Value::Varchar("10".into()),
+                                    Value::Varchar("Dynamic".into()),
+                                    Value::BigInt(0),
+                                    Value::BigInt(0),
+                                    Value::BigInt(0),
+                                    Value::BigInt(0),
+                                    Value::BigInt(0),
+                                    Value::BigInt(0),
+                                    Value::Null,
+                                    Value::Varchar("".into()),
+                                    Value::Null,
+                                    Value::Varchar("utf8mb4_general_ci".into()),
+                                    Value::Null,
+                                    Value::Varchar("".into()),
+                                    Value::Varchar("".into()),
+                                    Value::Varchar("".into()),
+                                ]);
+                            }
+                        }
+                        let cols = vec![
+                            "TABLE_CATALOG".into(), "TABLE_SCHEMA".into(), "TABLE_NAME".into(),
+                            "TABLE_TYPE".into(), "ENGINE".into(), "VERSION".into(),
+                            "ROW_FORMAT".into(), "TABLE_ROWS".into(), "AVG_ROW_LENGTH".into(),
+                            "DATA_LENGTH".into(), "MAX_DATA_LENGTH".into(), "INDEX_LENGTH".into(),
+                            "DATA_FREE".into(), "AUTO_INCREMENT".into(), "CREATE_TIME".into(),
+                            "UPDATE_TIME".into(), "TABLE_COLLATION".into(), "CHECKSUM".into(),
+                            "CREATE_OPTIONS".into(), "TABLE_COMMENT".into(), "MAX_INDEX_LENGTH".into(),
+                        ];
+                        self.send_result_set_with_types(&cols, &rows)?;
+                    }
+                    Err(_) => {
+                        self.send_empty_result_set(&["TABLE_CATALOG","TABLE_SCHEMA","TABLE_NAME","TABLE_TYPE"])?;
+                    }
+                }
+                return Ok(Some(()));
+            }
+            // Columns query
+            if upper.contains("COLUMNS") {
+                self.send_empty_result_set(&[
+                    "TABLE_CATALOG","TABLE_SCHEMA","TABLE_NAME","COLUMN_NAME",
+                    "ORDINAL_POSITION","COLUMN_DEFAULT","IS_NULLABLE","DATA_TYPE",
+                    "CHARACTER_MAXIMUM_LENGTH","NUMERIC_PRECISION","NUMERIC_SCALE",
+                    "COLUMN_TYPE","COLUMN_KEY","EXTRA","COLUMN_COMMENT",
+                ])?;
+                return Ok(Some(()));
+            }
+            // Any other information_schema query
+            self.send_empty_result_set(&["name"])?;
+            return Ok(Some(()));
+        }
+
+        // SELECT DATABASE() — DBeaver needs this
+        if upper == "SELECT DATABASE()" {
+            self.send_synthetic_result("DATABASE()", "forgedb")?;
+            return Ok(Some(()));
+        }
+
+        // SHOW GRANTS — DBeaver permissions check
+        if upper.starts_with("SHOW GRANTS") {
+            let cols = vec!["Grants for root@%".to_string()];
+            let rows = vec![vec![Value::Varchar("GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'".into())]];
+            self.send_result_set_with_types(&cols, &rows)?;
+            return Ok(Some(()));
+        }
+
+        // SHOW CREATE DATABASE
+        if upper.starts_with("SHOW CREATE DATABASE") || upper.starts_with("SHOW CREATE SCHEMA") {
+            let cols = vec!["Database".into(), "Create Database".into()];
+            let rows = vec![vec![
+                Value::Varchar("forgedb".into()),
+                Value::Varchar("CREATE DATABASE `forgedb` DEFAULT CHARACTER SET utf8mb4".into()),
+            ]];
+            self.send_result_set_with_types(&cols, &rows)?;
+            return Ok(Some(()));
+        }
+
+        // SHOW ENGINES, SHOW CHARSET, SHOW STATUS etc — DBeaver metadata
+        if upper.starts_with("SHOW ENGINES") {
+            let cols = vec!["Engine".into(),"Support".into(),"Comment".into(),"Transactions".into(),"XA".into(),"Savepoints".into()];
+            let rows = vec![vec![
+                Value::Varchar("InnoDB".into()),Value::Varchar("DEFAULT".into()),
+                Value::Varchar("ForgeDB storage engine".into()),Value::Varchar("YES".into()),
+                Value::Varchar("YES".into()),Value::Varchar("YES".into()),
+            ]];
+            self.send_result_set_with_types(&cols, &rows)?;
+            return Ok(Some(()));
+        }
+
+        if upper.starts_with("SHOW CHARSET") || upper.starts_with("SHOW CHARACTER SET") {
+            let cols = vec!["Charset".into(),"Description".into(),"Default collation".into(),"Maxlen".into()];
+            let rows = vec![vec![
+                Value::Varchar("utf8mb4".into()),Value::Varchar("UTF-8 Unicode".into()),
+                Value::Varchar("utf8mb4_general_ci".into()),Value::Varchar("4".into()),
+            ]];
+            self.send_result_set_with_types(&cols, &rows)?;
+            return Ok(Some(()));
+        }
+
+        if upper.starts_with("SHOW STATUS") || upper.starts_with("SHOW GLOBAL STATUS")
+            || upper.starts_with("SHOW SESSION STATUS") {
+            self.send_empty_result_set(&["Variable_name", "Value"])?;
+            return Ok(Some(()));
+        }
+
+        if upper.starts_with("SHOW GLOBAL VARIABLES") || upper.starts_with("SHOW SESSION VARIABLES") {
+            self.send_empty_result_set(&["Variable_name", "Value"])?;
+            return Ok(Some(()));
+        }
+
+        // SHOW PROCESSLIST
+        if upper.starts_with("SHOW PROCESSLIST") || upper.starts_with("SHOW FULL PROCESSLIST") {
+            let cols = vec!["Id".into(),"User".into(),"Host".into(),"db".into(),"Command".into(),"Time".into(),"State".into(),"Info".into()];
+            let rows = vec![vec![
+                Value::Varchar("1".into()),Value::Varchar("root".into()),
+                Value::Varchar("localhost".into()),Value::Varchar("forgedb".into()),
+                Value::Varchar("Query".into()),Value::Varchar("0".into()),
+                Value::Varchar("".into()),Value::Null,
+            ]];
+            self.send_result_set_with_types(&cols, &rows)?;
+            return Ok(Some(()));
+        }
+
+        // USE database — DBeaver switches databases
+        if upper.starts_with("USE ") {
+            let ok = Self::ok_packet(0, 0);
+            self.write_packet(&ok)?;
+            self.flush()?;
+            return Ok(Some(()));
+        }
+
         // SET commands -> OK
         if upper.starts_with("SET ") {
             let ok = Self::ok_packet(0, 0);
