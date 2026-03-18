@@ -17,10 +17,23 @@ pub fn execute_projection(
 
     for col in columns {
         match col {
-            SelectColumn::AllColumns(_) => {
+            SelectColumn::AllColumns(table_filter) => {
                 for c in &schema.columns {
-                    col_names.push(c.name.clone());
-                    eval_exprs.push(None); // marker for "use index directly"
+                    // If table qualifier given (e.g., t.*), only include that table's columns
+                    if let Some(tbl) = table_filter {
+                        let prefix = format!("{}.", tbl.to_lowercase());
+                        if !c.name.to_lowercase().starts_with(&prefix) {
+                            continue;
+                        }
+                    }
+                    // Strip table prefix for output: "t.term_id" -> "term_id"
+                    let name = if let Some(pos) = c.name.find('.') {
+                        c.name[pos + 1..].to_string()
+                    } else {
+                        c.name.clone()
+                    };
+                    col_names.push(name);
+                    eval_exprs.push(None);
                 }
             }
             SelectColumn::Expr { expr, alias } => {
@@ -57,13 +70,8 @@ pub fn execute_projection(
 
 fn expr_to_name(expr: &Expr) -> String {
     match expr {
-        Expr::ColumnRef { table, column } => {
-            if let Some(t) = table {
-                format!("{}.{}", t, column)
-            } else {
-                column.clone()
-            }
-        }
+        Expr::ColumnRef { column, .. } => column.clone(),
+        Expr::Function { name, .. } => format!("{}(?)", name),
         _ => "?".to_string(),
     }
 }
