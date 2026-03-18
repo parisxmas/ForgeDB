@@ -2,7 +2,7 @@ use crate::catalog::Catalog;
 use crate::error::{ForgeError, Result};
 use crate::index::{BTreeIndex, ClusteredIndex};
 use crate::sql::ast::Expr;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_file::HeapFile;
 use crate::tuple::schema::Schema;
 use crate::tuple::tuple::serialize;
@@ -16,7 +16,7 @@ pub fn execute_insert(
     table_name: &str,
     columns: &Option<Vec<String>>,
     values: &[Vec<Expr>],
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &Catalog,
     indexes: &mut Vec<(String, BTreeIndex)>,
     clustered_indexes: &mut std::collections::HashMap<String, ClusteredIndex>,

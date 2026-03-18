@@ -1,6 +1,6 @@
 use crate::common::*;
 use crate::error::Result;
-use crate::storage::buffer_pool::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_page;
 
 /// An iterator that walks through all non-deleted tuples in a heap file's
@@ -23,7 +23,7 @@ impl TableIterator {
     /// `None` when all tuples have been visited.
     pub fn next(
         &mut self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
     ) -> Result<Option<(RID, Vec<u8>)>> {
         loop {
             // Check if we have run out of pages.
@@ -74,31 +74,37 @@ impl TableIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::buffer_pool::BufferPoolManager;
+    use crate::storage::concurrent_bpm::ConcurrentBufferPool;
+    use crate::storage::local_bpm::LocalBpm;
     use crate::storage::disk_manager::DiskManager;
     use crate::storage::heap_file::HeapFile;
     use crate::storage::heap_page;
 
-    fn setup() -> (HeapFile, BufferPoolManager, tempfile::TempDir) {
+    fn setup() -> (HeapFile, ConcurrentBufferPool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let dm = DiskManager::new(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(10, dm);
+        let cbpm = ConcurrentBufferPool::new(10, dm);
 
-        let first_pid = bpm.new_page().unwrap();
+        let first_pid;
         {
-            let page = bpm.get_page_mut(first_pid);
-            heap_page::init(&mut page.data);
+            let mut bpm = LocalBpm::new(&cbpm);
+            first_pid = bpm.new_page().unwrap();
+            {
+                let page = bpm.get_page_mut(first_pid);
+                heap_page::init(&mut page.data);
+            }
+            bpm.unpin_page(first_pid, true).unwrap();
         }
-        bpm.unpin_page(first_pid, true).unwrap();
 
         let hf = HeapFile::new(TableId(0), first_pid);
-        (hf, bpm, dir)
+        (hf, cbpm, dir)
     }
 
     #[test]
     fn test_empty_table() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut iter = TableIterator::new(hf.first_page_id);
         let result = iter.next(&mut bpm).unwrap();
         assert!(result.is_none());
@@ -106,7 +112,8 @@ mod tests {
 
     #[test]
     fn test_iterate_all() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
 
         let mut expected = Vec::new();
         for i in 0u32..5 {
@@ -130,7 +137,8 @@ mod tests {
 
     #[test]
     fn test_iterate_across_pages() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
 
         // Insert enough large tuples to span multiple pages.
         let big = vec![0xCDu8; 500];
@@ -151,7 +159,8 @@ mod tests {
 
     #[test]
     fn test_iterate_skips_deleted() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
 
         let r0 = hf.insert_tuple(&mut bpm, b"aaa").unwrap();
         let _r1 = hf.insert_tuple(&mut bpm, b"bbb").unwrap();

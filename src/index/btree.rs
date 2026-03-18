@@ -11,10 +11,11 @@
 use crate::common::{PageId, RID, TableId, INVALID_PAGE_ID};
 use crate::error::{ForgeError, Result};
 use crate::index::btree_page;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::tuple::types::{DataType, Value};
 
 /// A B-tree index over a single column of a table.
+#[derive(Clone)]
 pub struct BTreeIndex {
     pub root_page_id: PageId,
     pub key_type: DataType,
@@ -41,7 +42,7 @@ impl BTreeIndex {
     /// Allocate a new root page (initialised as an empty leaf) and return the
     /// index handle.
     pub fn create(
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         key_type: DataType,
         table_id: TableId,
         key_column_index: usize,
@@ -66,7 +67,7 @@ impl BTreeIndex {
     // -----------------------------------------------------------------------
 
     /// Look up an exact key and return its RID (if present).
-    pub fn search(&self, bpm: &mut BufferPoolManager, key: &Value) -> Result<Option<RID>> {
+    pub fn search(&self, bpm: &mut LocalBpm, key: &Value) -> Result<Option<RID>> {
         let key_bytes = key.to_sort_key_bytes();
         let leaf_id = self.find_leaf(bpm, &key_bytes)?;
 
@@ -84,7 +85,7 @@ impl BTreeIndex {
     /// Insert a (key, RID) pair into the index. Splits pages as needed.
     pub fn insert(
         &mut self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         key: &Value,
         rid: RID,
     ) -> Result<()> {
@@ -121,10 +122,15 @@ impl BTreeIndex {
 
         let mid = all_entries.len() / 2;
 
+        // Unpin leaf before allocating (LocalBpm single-page cache).
+        bpm.unpin_page(leaf_id, false)?;
+
         // Allocate new leaf.
         let new_leaf_id = bpm.new_page()?;
+        bpm.unpin_page(new_leaf_id, false)?;
 
         // Re-init old leaf and populate with the lower half.
+        bpm.fetch_page(leaf_id)?;
         {
             let page = bpm.get_page_mut(leaf_id);
             btree_page::leaf_init(&mut page.data);
@@ -136,6 +142,7 @@ impl BTreeIndex {
         bpm.unpin_page(leaf_id, true)?;
 
         // Populate new leaf with upper half.
+        bpm.fetch_page(new_leaf_id)?;
         {
             let page = bpm.get_page_mut(new_leaf_id);
             btree_page::leaf_init(&mut page.data);
@@ -160,7 +167,7 @@ impl BTreeIndex {
     /// parent, a new root is created.
     fn insert_into_parent(
         &mut self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         left_page_id: PageId,
         key: &[u8],
         right_page_id: PageId,
@@ -213,10 +220,15 @@ impl BTreeIndex {
         // either child internal node.
         let push_up_key = entries[mid].0.clone();
 
+        // Unpin parent before allocating (LocalBpm single-page cache).
+        bpm.unpin_page(parent_id, false)?;
+
         // Allocate new internal node.
         let new_internal_id = bpm.new_page()?;
+        bpm.unpin_page(new_internal_id, false)?;
 
         // Re-init old internal node with entries [0..mid).
+        bpm.fetch_page(parent_id)?;
         {
             let page = bpm.get_page_mut(parent_id);
             btree_page::internal_init(&mut page.data);
@@ -229,6 +241,7 @@ impl BTreeIndex {
 
         // New internal node gets entries [mid+1..].
         // Its first_child is the right_child of entries[mid].
+        bpm.fetch_page(new_internal_id)?;
         {
             let page = bpm.get_page_mut(new_internal_id);
             btree_page::internal_init(&mut page.data);
@@ -253,7 +266,7 @@ impl BTreeIndex {
     /// No rebalancing is performed (lazy deletion).
     pub fn delete(
         &mut self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         key: &Value,
     ) -> Result<bool> {
         let key_bytes = key.to_sort_key_bytes();
@@ -276,7 +289,7 @@ impl BTreeIndex {
     /// Returns entries in ascending key order.
     pub fn range_scan(
         &self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         start_key: Option<&Value>,
         end_key: Option<&Value>,
     ) -> Result<Vec<(Vec<u8>, RID)>> {
@@ -336,7 +349,7 @@ impl BTreeIndex {
 
     /// Traverse from the root to find the leaf page that should contain the
     /// given key.
-    fn find_leaf(&self, bpm: &mut BufferPoolManager, key: &[u8]) -> Result<PageId> {
+    fn find_leaf(&self, bpm: &mut LocalBpm, key: &[u8]) -> Result<PageId> {
         let mut current_id = self.root_page_id;
 
         loop {
@@ -354,7 +367,7 @@ impl BTreeIndex {
     }
 
     /// Find the leftmost leaf by always following child_0.
-    fn find_leftmost_leaf(&self, bpm: &mut BufferPoolManager) -> Result<PageId> {
+    fn find_leftmost_leaf(&self, bpm: &mut LocalBpm) -> Result<PageId> {
         let mut current_id = self.root_page_id;
 
         loop {
@@ -374,7 +387,7 @@ impl BTreeIndex {
     /// This is O(n) but acceptable for an educational implementation.
     fn find_parent(
         &self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         current_id: PageId,
         target_page_id: PageId,
     ) -> Result<PageId> {
@@ -430,19 +443,22 @@ impl BTreeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::concurrent_bpm::ConcurrentBufferPool;
+    use crate::storage::local_bpm::LocalBpm;
     use crate::storage::disk_manager::DiskManager;
 
-    fn make_bpm(pool_size: usize) -> (BufferPoolManager, tempfile::TempDir) {
+    fn make_bpm(pool_size: usize) -> (ConcurrentBufferPool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_btree.db");
         let dm = DiskManager::new(&path).unwrap();
-        let bpm = BufferPoolManager::new(pool_size, dm);
-        (bpm, dir)
+        let cbpm = ConcurrentBufferPool::new(pool_size, dm);
+        (cbpm, dir)
     }
 
     #[test]
     fn test_insert_and_search_single() {
-        let (mut bpm, _dir) = make_bpm(64);
+        let (cbpm, _dir) = make_bpm(64);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let key = Value::Integer(42);
@@ -459,7 +475,8 @@ mod tests {
 
     #[test]
     fn test_insert_many_and_search_all() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let n = 500;
@@ -479,7 +496,8 @@ mod tests {
 
     #[test]
     fn test_insert_reverse_order() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let n = 300;
@@ -501,7 +519,8 @@ mod tests {
     fn test_leaf_split() {
         // With 16KB pages, a leaf fits ~1259 entries (5-byte keys).
         // Insert 1500 to force at least one split.
-        let (mut bpm, _dir) = make_bpm(128);
+        let (cbpm, _dir) = make_bpm(128);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let n = 1500;
@@ -535,7 +554,8 @@ mod tests {
     fn test_internal_node_split() {
         // With varchar keys of ~100 bytes, entries are large and internal
         // nodes fill up faster, forcing internal splits.
-        let (mut bpm, _dir) = make_bpm(1024);
+        let (cbpm, _dir) = make_bpm(1024);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Varchar(120), TableId(0), 0).unwrap();
 
         let n = 2000;
@@ -557,7 +577,8 @@ mod tests {
 
     #[test]
     fn test_range_scan() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let n = 200;
@@ -581,7 +602,8 @@ mod tests {
 
     #[test]
     fn test_range_scan_unbounded() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         for i in 0..100 {
@@ -609,7 +631,8 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let (mut bpm, _dir) = make_bpm(128);
+        let (cbpm, _dir) = make_bpm(128);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         for i in 0..100 {
@@ -635,7 +658,8 @@ mod tests {
 
     #[test]
     fn test_delete_many() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let n = 500;
@@ -665,7 +689,8 @@ mod tests {
 
     #[test]
     fn test_large_scale_10k() {
-        let (mut bpm, _dir) = make_bpm(2048);
+        let (cbpm, _dir) = make_bpm(2048);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         let n: i32 = 10_000;
@@ -702,7 +727,8 @@ mod tests {
 
     #[test]
     fn test_varchar_keys() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Varchar(50), TableId(0), 0).unwrap();
 
         let words = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape"];
@@ -729,7 +755,8 @@ mod tests {
 
     #[test]
     fn test_negative_integers() {
-        let (mut bpm, _dir) = make_bpm(256);
+        let (cbpm, _dir) = make_bpm(256);
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = BTreeIndex::create(&mut bpm, DataType::Integer, TableId(0), 0).unwrap();
 
         for i in -100..100 {

@@ -1,7 +1,7 @@
 use crate::catalog::Catalog;
 use crate::error::{ForgeError, Result};
 use crate::index::BTreeIndex;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::table_iterator::TableIterator;
 use crate::tuple::tuple::deserialize;
 use crate::tuple::types::Value;
@@ -14,7 +14,7 @@ pub fn execute_create_index(
     table_name: &str,
     columns: &[String],
     _unique: bool,
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &Catalog,
     indexes: &mut Vec<(String, BTreeIndex)>,
 ) -> Result<ExecuteResult> {

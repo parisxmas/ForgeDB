@@ -21,6 +21,7 @@ pub struct TableInfo {
 ///
 /// The catalog can be persisted to and loaded from a binary `.catalog` file so
 /// that table definitions survive across restarts.
+#[derive(Clone)]
 pub struct Catalog {
     tables: HashMap<String, TableInfo>,
     next_table_id: u32,

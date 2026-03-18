@@ -1,6 +1,6 @@
 use crate::common::*;
 use crate::error::{ForgeError, Result};
-use crate::storage::buffer_pool::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_page;
 
 /// A heap file is a collection of slotted pages linked together, belonging to
@@ -22,7 +22,7 @@ impl HeapFile {
     /// Insert a tuple into the heap file. Walks the linked list of pages
     /// looking for one with enough free space, and allocates a new page if
     /// none is found. Returns the RID of the inserted tuple.
-    pub fn insert_tuple(&self, bpm: &mut BufferPoolManager, data: &[u8]) -> Result<RID> {
+    pub fn insert_tuple(&self, bpm: &mut LocalBpm, data: &[u8]) -> Result<RID> {
         let mut current_pid = self.first_page_id;
 
         loop {
@@ -60,6 +60,7 @@ impl HeapFile {
         }
 
         // Link the new page from the last page.
+        bpm.unpin_page(new_pid, true)?;
         bpm.fetch_page(current_pid)?;
         {
             let last_page = bpm.get_page_mut(current_pid);
@@ -68,6 +69,7 @@ impl HeapFile {
         bpm.unpin_page(current_pid, true)?;
 
         // Insert the tuple into the new page.
+        bpm.fetch_page(new_pid)?;
         let slot_id = {
             let new_page = bpm.get_page_mut(new_pid);
             heap_page::insert_tuple(&mut new_page.data, data)
@@ -82,7 +84,7 @@ impl HeapFile {
     }
 
     /// Read a tuple by its RID.
-    pub fn get_tuple(&self, bpm: &mut BufferPoolManager, rid: RID) -> Result<Vec<u8>> {
+    pub fn get_tuple(&self, bpm: &mut LocalBpm, rid: RID) -> Result<Vec<u8>> {
         bpm.fetch_page(rid.page_id)?;
         let data = {
             let page = bpm.get_page(rid.page_id);
@@ -93,7 +95,7 @@ impl HeapFile {
     }
 
     /// Delete a tuple by its RID.
-    pub fn delete_tuple(&self, bpm: &mut BufferPoolManager, rid: RID) -> Result<()> {
+    pub fn delete_tuple(&self, bpm: &mut LocalBpm, rid: RID) -> Result<()> {
         bpm.fetch_page(rid.page_id)?;
         let ok = {
             let page = bpm.get_page_mut(rid.page_id);
@@ -115,7 +117,7 @@ impl HeapFile {
     /// old tuple is deleted and a new one is inserted, returning the new RID.
     pub fn update_tuple(
         &self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         rid: RID,
         data: &[u8],
     ) -> Result<RID> {
@@ -144,31 +146,37 @@ impl HeapFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::buffer_pool::BufferPoolManager;
+    use crate::storage::concurrent_bpm::ConcurrentBufferPool;
+    use crate::storage::local_bpm::LocalBpm;
     use crate::storage::disk_manager::DiskManager;
     use crate::storage::heap_page;
 
-    fn setup() -> (HeapFile, BufferPoolManager, tempfile::TempDir) {
+    fn setup() -> (HeapFile, ConcurrentBufferPool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let dm = DiskManager::new(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(10, dm);
+        let dm = DiskManager::new(path.to_str().unwrap()).unwrap();
+        let cbpm = ConcurrentBufferPool::new(10, dm);
 
-        // Allocate the first page and initialize it as a slotted page.
-        let first_pid = bpm.new_page().unwrap();
+        let first_pid;
         {
-            let page = bpm.get_page_mut(first_pid);
-            heap_page::init(&mut page.data);
+            let mut bpm = LocalBpm::new(&cbpm);
+            // Allocate the first page and initialize it as a slotted page.
+            first_pid = bpm.new_page().unwrap();
+            {
+                let page = bpm.get_page_mut(first_pid);
+                heap_page::init(&mut page.data);
+            }
+            bpm.unpin_page(first_pid, true).unwrap();
         }
-        bpm.unpin_page(first_pid, true).unwrap();
 
         let hf = HeapFile::new(TableId(0), first_pid);
-        (hf, bpm, dir)
+        (hf, cbpm, dir)
     }
 
     #[test]
     fn test_insert_and_get() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
         let rid = hf.insert_tuple(&mut bpm, b"hello").unwrap();
         let data = hf.get_tuple(&mut bpm, rid).unwrap();
         assert_eq!(data, b"hello");
@@ -176,7 +184,8 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
         let rid = hf.insert_tuple(&mut bpm, b"to be deleted").unwrap();
         hf.delete_tuple(&mut bpm, rid).unwrap();
         let result = hf.get_tuple(&mut bpm, rid);
@@ -185,7 +194,8 @@ mod tests {
 
     #[test]
     fn test_update_in_place() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
         let rid = hf.insert_tuple(&mut bpm, b"hello world").unwrap();
         let new_rid = hf.update_tuple(&mut bpm, rid, b"hi").unwrap();
         // In-place update keeps the same RID.
@@ -196,7 +206,8 @@ mod tests {
 
     #[test]
     fn test_update_larger() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
         let rid = hf.insert_tuple(&mut bpm, b"hi").unwrap();
         let new_rid = hf
             .update_tuple(&mut bpm, rid, b"this is much longer data")
@@ -208,7 +219,8 @@ mod tests {
 
     #[test]
     fn test_multiple_pages() {
-        let (hf, mut bpm, _dir) = setup();
+        let (hf, cbpm, _dir) = setup();
+        let mut bpm = LocalBpm::new(&cbpm);
         // Insert enough tuples to force a second page allocation.
         let big = vec![0xABu8; 2000];
         let mut rids = Vec::new();

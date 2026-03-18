@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::common::{PageId, INVALID_PAGE_ID, PAGE_SIZE};
 use crate::error::{ForgeError, Result};
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::tuple::types::Value;
 
 // ---------------------------------------------------------------------------
@@ -266,6 +266,7 @@ fn internal_search_child(page: &[u8; PAGE_SIZE], key: &[u8]) -> u32 {
 
 /// A clustered B+ tree index that stores full row data in leaf nodes.
 /// Eliminates the heap-file indirection for primary key lookups.
+#[derive(Clone)]
 pub struct ClusteredIndex {
     pub root_page_id: PageId,
     pub key_column_index: usize,
@@ -273,7 +274,7 @@ pub struct ClusteredIndex {
 
 impl ClusteredIndex {
     /// Create a new empty clustered index.
-    pub fn create(bpm: &mut BufferPoolManager, key_column_index: usize) -> Result<Self> {
+    pub fn create(bpm: &mut LocalBpm, key_column_index: usize) -> Result<Self> {
         let page_id = bpm.new_page()?;
         {
             let page = bpm.get_page_mut(page_id);
@@ -287,7 +288,7 @@ impl ClusteredIndex {
     }
 
     /// Search by key, returns serialized row data if found.
-    pub fn search(&self, bpm: &mut BufferPoolManager, key: &Value) -> Result<Option<Vec<u8>>> {
+    pub fn search(&self, bpm: &mut LocalBpm, key: &Value) -> Result<Option<Vec<u8>>> {
         let key_bytes = key.to_sort_key_bytes();
         let leaf_id = self.find_leaf(bpm, &key_bytes)?;
 
@@ -301,7 +302,7 @@ impl ClusteredIndex {
     /// Insert a row with its key.
     pub fn insert(
         &mut self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         key: &Value,
         row_data: &[u8],
     ) -> Result<()> {
@@ -332,9 +333,15 @@ impl ClusteredIndex {
         };
 
         let mid = all_entries.len() / 2;
+
+        // Unpin leaf before allocating (LocalBpm single-page cache).
+        bpm.unpin_page(leaf_id, false)?;
+
         let new_leaf_id = bpm.new_page()?;
+        bpm.unpin_page(new_leaf_id, false)?;
 
         // Old leaf gets lower half
+        bpm.fetch_page(leaf_id)?;
         {
             let page = bpm.get_page_mut(leaf_id);
             leaf_init(&mut page.data);
@@ -345,6 +352,7 @@ impl ClusteredIndex {
         bpm.unpin_page(leaf_id, true)?;
 
         // New leaf gets upper half
+        bpm.fetch_page(new_leaf_id)?;
         {
             let page = bpm.get_page_mut(new_leaf_id);
             leaf_init(&mut page.data);
@@ -361,7 +369,7 @@ impl ClusteredIndex {
     }
 
     /// Delete by key. Returns the old row data if found.
-    pub fn delete(&mut self, bpm: &mut BufferPoolManager, key: &Value) -> Result<Option<Vec<u8>>> {
+    pub fn delete(&mut self, bpm: &mut LocalBpm, key: &Value) -> Result<Option<Vec<u8>>> {
         let key_bytes = key.to_sort_key_bytes();
         let leaf_id = self.find_leaf(bpm, &key_bytes)?;
 
@@ -380,7 +388,7 @@ impl ClusteredIndex {
     }
 
     /// Scan all rows in key order. Returns (key_bytes, row_data) pairs.
-    pub fn scan_all(&self, bpm: &mut BufferPoolManager) -> Result<Vec<Vec<u8>>> {
+    pub fn scan_all(&self, bpm: &mut LocalBpm) -> Result<Vec<Vec<u8>>> {
         let first_leaf = self.find_leftmost_leaf(bpm)?;
         let mut rows = Vec::new();
         let mut current = first_leaf;
@@ -409,7 +417,7 @@ impl ClusteredIndex {
     /// Scan rows matching a predicate on serialized key bytes.
     pub fn scan_range(
         &self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
     ) -> Result<Vec<Vec<u8>>> {
@@ -456,7 +464,7 @@ impl ClusteredIndex {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn find_leaf(&self, bpm: &mut BufferPoolManager, key: &[u8]) -> Result<PageId> {
+    fn find_leaf(&self, bpm: &mut LocalBpm, key: &[u8]) -> Result<PageId> {
         let mut current = self.root_page_id;
         loop {
             bpm.fetch_page(current)?;
@@ -474,7 +482,7 @@ impl ClusteredIndex {
         }
     }
 
-    fn find_leftmost_leaf(&self, bpm: &mut BufferPoolManager) -> Result<PageId> {
+    fn find_leftmost_leaf(&self, bpm: &mut LocalBpm) -> Result<PageId> {
         let mut current = self.root_page_id;
         loop {
             bpm.fetch_page(current)?;
@@ -494,7 +502,7 @@ impl ClusteredIndex {
 
     fn find_parent(
         &self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         current: PageId,
         target: PageId,
     ) -> Result<PageId> {
@@ -533,7 +541,7 @@ impl ClusteredIndex {
 
     fn insert_into_parent(
         &mut self,
-        bpm: &mut BufferPoolManager,
+        bpm: &mut LocalBpm,
         left_id: PageId,
         key: &[u8],
         right_id: PageId,
@@ -578,8 +586,14 @@ impl ClusteredIndex {
 
         let mid = entries.len() / 2;
         let push_up = entries[mid].0.clone();
-        let new_internal = bpm.new_page()?;
 
+        // Unpin parent before allocating (LocalBpm single-page cache).
+        bpm.unpin_page(parent_id, false)?;
+
+        let new_internal = bpm.new_page()?;
+        bpm.unpin_page(new_internal, false)?;
+
+        bpm.fetch_page(parent_id)?;
         {
             let page = bpm.get_page_mut(parent_id);
             internal_init(&mut page.data);
@@ -590,6 +604,7 @@ impl ClusteredIndex {
         }
         bpm.unpin_page(parent_id, true)?;
 
+        bpm.fetch_page(new_internal)?;
         {
             let page = bpm.get_page_mut(new_internal);
             internal_init(&mut page.data);
@@ -607,19 +622,23 @@ impl ClusteredIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::concurrent_bpm::ConcurrentBufferPool;
+    use crate::storage::local_bpm::LocalBpm;
     use crate::storage::DiskManager;
     use tempfile::TempDir;
 
-    fn make_bpm(dir: &TempDir) -> BufferPoolManager {
+    fn make_bpm() -> (ConcurrentBufferPool, TempDir) {
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.db");
         let dm = DiskManager::new(path.to_str().unwrap()).unwrap();
-        BufferPoolManager::new(256, dm)
+        let cbpm = ConcurrentBufferPool::new(256, dm);
+        (cbpm, dir)
     }
 
     #[test]
     fn test_clustered_insert_and_search() {
-        let dir = TempDir::new().unwrap();
-        let mut bpm = make_bpm(&dir);
+        let (cbpm, _dir) = make_bpm();
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = ClusteredIndex::create(&mut bpm, 0).unwrap();
 
         let key = Value::Integer(42);
@@ -635,8 +654,8 @@ mod tests {
 
     #[test]
     fn test_clustered_scan_all() {
-        let dir = TempDir::new().unwrap();
-        let mut bpm = make_bpm(&dir);
+        let (cbpm, _dir) = make_bpm();
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = ClusteredIndex::create(&mut bpm, 0).unwrap();
 
         for i in 0..100 {
@@ -654,8 +673,8 @@ mod tests {
 
     #[test]
     fn test_clustered_delete() {
-        let dir = TempDir::new().unwrap();
-        let mut bpm = make_bpm(&dir);
+        let (cbpm, _dir) = make_bpm();
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = ClusteredIndex::create(&mut bpm, 0).unwrap();
 
         for i in 0..10 {
@@ -674,8 +693,8 @@ mod tests {
 
     #[test]
     fn test_clustered_splits() {
-        let dir = TempDir::new().unwrap();
-        let mut bpm = make_bpm(&dir);
+        let (cbpm, _dir) = make_bpm();
+        let mut bpm = LocalBpm::new(&cbpm);
         let mut idx = ClusteredIndex::create(&mut bpm, 0).unwrap();
 
         // Insert enough to trigger multiple splits (each row ~50 bytes, page=4096)

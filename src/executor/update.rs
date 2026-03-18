@@ -3,7 +3,7 @@ use crate::common::RID;
 use crate::error::{ForgeError, Result};
 use crate::index::BTreeIndex;
 use crate::sql::ast::Assignment;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_file::HeapFile;
 use crate::tuple::tuple::serialize;
 use crate::tuple::types::Value;
@@ -16,7 +16,7 @@ pub fn execute_update(
     table_name: &str,
     assignments: &[Assignment],
     rows: Vec<(RID, Vec<Value>)>,
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &Catalog,
     indexes: &mut Vec<(String, BTreeIndex)>,
 ) -> Result<ExecuteResult> {

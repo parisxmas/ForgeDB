@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::common::*;
 use crate::error::{ForgeError, Result};
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use super::wal::{Wal, WalRecord};
 
 /// Manages transactions: begin, commit, abort, WAL logging, and crash recovery.
@@ -83,7 +83,7 @@ impl TransactionManager {
 
     /// Redo-only recovery: read all WAL records, determine which transactions
     /// committed, then replay their PageWrite after-images via the buffer pool.
-    pub fn recover(&mut self, bpm: &mut BufferPoolManager) -> Result<()> {
+    pub fn recover(&mut self, bpm: &mut LocalBpm) -> Result<()> {
         let records = self.wal.read_all_records()?;
 
         // First pass: determine which transactions committed.
@@ -118,7 +118,7 @@ impl TransactionManager {
     }
 
     /// Checkpoint: flush all dirty pages, write a Checkpoint record, truncate WAL.
-    pub fn checkpoint(&mut self, bpm: &mut BufferPoolManager) -> Result<()> {
+    pub fn checkpoint(&mut self, bpm: &mut LocalBpm) -> Result<()> {
         bpm.flush_all()?;
         self.wal.append(&WalRecord::Checkpoint)?;
         self.wal.truncate()?;
@@ -129,16 +129,13 @@ impl TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::concurrent_bpm::ConcurrentBufferPool;
     use crate::storage::disk_manager::DiskManager;
 
-    /// Helper: create a `BufferPoolManager` backed by a temp directory.
-    fn make_bpm(
-        dir: &tempfile::TempDir,
-        pool_size: usize,
-    ) -> BufferPoolManager {
+    fn make_cbpm(dir: &tempfile::TempDir, pool_size: usize) -> ConcurrentBufferPool {
         let path = dir.path().join("test.db");
-        let dm = DiskManager::new(&path).unwrap();
-        BufferPoolManager::new(pool_size, dm)
+        let dm = DiskManager::new(path.to_str().unwrap()).unwrap();
+        ConcurrentBufferPool::new(pool_size, dm)
     }
 
     #[test]
@@ -216,7 +213,7 @@ mod tests {
         // Phase 1: write data through a transaction manager + buffer pool,
         // then simulate a "crash" by dropping them without checkpoint.
         {
-            let mut bpm = make_bpm(&dir, 4);
+            let cbpm = make_cbpm(&dir, 4); let mut bpm = LocalBpm::new(&cbpm);
             let mut tm = TransactionManager::new(wal_str).unwrap();
 
             // Allocate a page and remember its id.
@@ -244,7 +241,7 @@ mod tests {
 
         // Phase 2: recover using the WAL.
         {
-            let mut bpm = make_bpm(&dir, 4);
+            let cbpm = make_cbpm(&dir, 4); let mut bpm = LocalBpm::new(&cbpm);
             let mut tm = TransactionManager::new(wal_str).unwrap();
 
             tm.recover(&mut bpm).unwrap();
@@ -266,7 +263,7 @@ mod tests {
 
         // Phase 1: one committed txn, one aborted txn that writes to the same page.
         {
-            let mut bpm = make_bpm(&dir, 4);
+            let cbpm = make_cbpm(&dir, 4); let mut bpm = LocalBpm::new(&cbpm);
             let mut tm = TransactionManager::new(wal_str).unwrap();
 
             let pid = bpm.new_page().unwrap();
@@ -292,7 +289,7 @@ mod tests {
 
         // Phase 2: recover. Only committed writes should be replayed.
         {
-            let mut bpm = make_bpm(&dir, 4);
+            let cbpm = make_cbpm(&dir, 4); let mut bpm = LocalBpm::new(&cbpm);
             let mut tm = TransactionManager::new(wal_str).unwrap();
 
             tm.recover(&mut bpm).unwrap();
@@ -311,7 +308,7 @@ mod tests {
         let wal_path = dir.path().join("txn.wal");
         let wal_str = wal_path.to_str().unwrap();
 
-        let mut bpm = make_bpm(&dir, 4);
+        let cbpm = make_cbpm(&dir, 4); let mut bpm = LocalBpm::new(&cbpm);
         let mut tm = TransactionManager::new(wal_str).unwrap();
 
         let txn = tm.begin().unwrap();

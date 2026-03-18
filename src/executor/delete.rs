@@ -2,7 +2,7 @@ use crate::catalog::Catalog;
 use crate::common::RID;
 use crate::error::{ForgeError, Result};
 use crate::index::{BTreeIndex, ClusteredIndex};
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_file::HeapFile;
 use crate::tuple::types::Value;
 
@@ -12,7 +12,7 @@ use super::executor::ExecuteResult;
 pub fn execute_delete(
     table_name: &str,
     rows: Vec<(RID, Vec<Value>)>,
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &Catalog,
     indexes: &mut Vec<(String, BTreeIndex)>,
     clustered_indexes: &mut std::collections::HashMap<String, ClusteredIndex>,

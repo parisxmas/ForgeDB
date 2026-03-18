@@ -2,7 +2,7 @@ use crate::catalog::Catalog;
 use crate::common::PageId;
 use crate::error::Result;
 use crate::sql::ast::ColumnDef;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_page;
 use crate::tuple::schema::{Column, Schema};
 
@@ -12,7 +12,7 @@ use super::executor::ExecuteResult;
 pub fn execute_create_table(
     table_name: &str,
     column_defs: &[ColumnDef],
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &mut Catalog,
 ) -> Result<ExecuteResult> {
     // Build schema from column definitions

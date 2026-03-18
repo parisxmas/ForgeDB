@@ -3,7 +3,7 @@ use crate::common::RID;
 use crate::error::{ForgeError, Result};
 use crate::index::BTreeIndex;
 use crate::sql::ast::Expr;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_file::HeapFile;
 use crate::tuple::schema::Schema;
 use crate::tuple::tuple::deserialize;
@@ -16,7 +16,7 @@ pub fn execute_index_scan(
     table_name: &str,
     index_column: &str,
     lookup_value: &Expr,
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &Catalog,
     indexes: &[(String, BTreeIndex)],
 ) -> Result<(Schema, Vec<(RID, Vec<Value>)>)> {

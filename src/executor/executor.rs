@@ -3,7 +3,7 @@ use crate::common::RID;
 use crate::error::Result;
 use crate::index::{BTreeIndex, ClusteredIndex};
 use crate::planner::plan::PlanNode;
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::tuple::schema::Schema;
 use crate::tuple::types::Value;
 
@@ -13,8 +13,8 @@ use super::{
 };
 
 /// Context passed to executors.
-pub struct ExecutorContext<'a> {
-    pub bpm: &'a mut BufferPoolManager,
+pub struct ExecutorContext<'a, 'b> {
+    pub bpm: &'a mut LocalBpm<'b>,
     pub catalog: &'a mut Catalog,
     pub indexes: &'a mut Vec<(String, BTreeIndex)>,
     pub clustered_indexes: &'a mut std::collections::HashMap<String, ClusteredIndex>,

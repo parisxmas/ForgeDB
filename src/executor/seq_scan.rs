@@ -1,7 +1,7 @@
 use crate::catalog::Catalog;
 use crate::common::RID;
 use crate::error::{ForgeError, Result};
-use crate::storage::BufferPoolManager;
+use crate::storage::local_bpm::LocalBpm;
 use crate::storage::table_iterator::TableIterator;
 use crate::tuple::schema::Schema;
 use crate::tuple::tuple::deserialize;
@@ -10,7 +10,7 @@ use crate::tuple::types::Value;
 /// Execute a sequential scan of all tuples in a table.
 pub fn execute_seq_scan(
     table_name: &str,
-    bpm: &mut BufferPoolManager,
+    bpm: &mut LocalBpm,
     catalog: &Catalog,
 ) -> Result<(Schema, Vec<(RID, Vec<Value>)>)> {
     let info = catalog
