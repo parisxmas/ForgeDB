@@ -2,6 +2,17 @@ use crate::common::*;
 use crate::error::{ForgeError, Result};
 use crate::storage::local_bpm::LocalBpm;
 use crate::storage::heap_page;
+use crate::storage::overflow;
+
+/// Overflow marker byte. If a tuple's first byte is 0xFF and length is 5,
+/// the remaining 4 bytes are the PageId of the first overflow page.
+const OVERFLOW_MARKER: u8 = 0xFF;
+const OVERFLOW_POINTER_SIZE: usize = 5; // marker(1) + page_id(4)
+
+/// Max tuple size that fits inline (page usable space minus slot overhead).
+fn max_inline_size() -> usize {
+    PAGE_SIZE - 12 - 4 - 16 // conservative: header + one slot + margin
+}
 
 /// A heap file is a collection of slotted pages linked together, belonging to
 /// a single table.
@@ -23,13 +34,29 @@ impl HeapFile {
     /// looking for one with enough free space, and allocates a new page if
     /// none is found. Returns the RID of the inserted tuple.
     pub fn insert_tuple(&self, bpm: &mut LocalBpm, data: &[u8]) -> Result<RID> {
+        // If tuple is too large for any page, use overflow immediately
+        let needs_overflow = data.len() > max_inline_size();
+        let insert_data: Vec<u8>;
+        let data_to_insert = if needs_overflow {
+            let overflow_pid = overflow::write_overflow(bpm, data)?;
+            insert_data = {
+                let mut p = vec![0u8; OVERFLOW_POINTER_SIZE];
+                p[0] = OVERFLOW_MARKER;
+                p[1..5].copy_from_slice(&overflow_pid.0.to_le_bytes());
+                p
+            };
+            &insert_data[..]
+        } else {
+            data
+        };
+
         let mut current_pid = self.first_page_id;
 
         loop {
             bpm.fetch_page(current_pid)?;
             {
                 let page = bpm.get_page_mut(current_pid);
-                if let Some(slot_id) = heap_page::insert_tuple(&mut page.data, data) {
+                if let Some(slot_id) = heap_page::insert_tuple(&mut page.data, data_to_insert) {
                     let rid = RID {
                         page_id: current_pid,
                         slot_id,
@@ -68,12 +95,12 @@ impl HeapFile {
         }
         bpm.unpin_page(current_pid, true)?;
 
-        // Insert the tuple into the new page.
+        // Insert into the new page (data_to_insert is already overflow-safe).
         bpm.fetch_page(new_pid)?;
         let slot_id = {
             let new_page = bpm.get_page_mut(new_pid);
-            heap_page::insert_tuple(&mut new_page.data, data)
-                .ok_or_else(|| ForgeError::Page("tuple too large for empty page".to_string()))?
+            heap_page::insert_tuple(&mut new_page.data, data_to_insert)
+                .ok_or_else(|| ForgeError::Page("cannot store tuple/pointer".to_string()))?
         };
         bpm.unpin_page(new_pid, true)?;
 
@@ -83,15 +110,23 @@ impl HeapFile {
         })
     }
 
-    /// Read a tuple by its RID.
+    /// Read a tuple by its RID. Handles overflow pages transparently.
     pub fn get_tuple(&self, bpm: &mut LocalBpm, rid: RID) -> Result<Vec<u8>> {
         bpm.fetch_page(rid.page_id)?;
-        let data = {
+        let raw = {
             let page = bpm.get_page(rid.page_id);
             heap_page::get_tuple(&page.data, rid.slot_id)
         };
         bpm.unpin_page(rid.page_id, false)?;
-        data.ok_or_else(|| ForgeError::Tuple(format!("tuple not found at {:?}", rid)))
+        let raw = raw.ok_or_else(|| ForgeError::Tuple(format!("tuple not found at {:?}", rid)))?;
+
+        // Check for overflow pointer
+        if raw.len() == OVERFLOW_POINTER_SIZE && raw[0] == OVERFLOW_MARKER {
+            let overflow_pid = PageId(u32::from_le_bytes([raw[1], raw[2], raw[3], raw[4]]));
+            return overflow::read_overflow(bpm, overflow_pid);
+        }
+
+        Ok(raw)
     }
 
     /// Delete a tuple by its RID.

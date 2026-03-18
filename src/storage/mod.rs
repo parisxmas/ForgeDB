@@ -3,6 +3,7 @@ pub mod disk_manager;
 pub mod buffer_pool;
 pub mod concurrent_bpm;
 pub mod local_bpm;
+pub mod overflow;
 pub mod heap_page;
 pub mod heap_file;
 pub mod table_iterator;
