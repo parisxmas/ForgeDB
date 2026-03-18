@@ -873,8 +873,7 @@ impl ConnectionHandler {
         // Strip "SQL_CALC_FOUND_ROWS"
         s = s.replace("SQL_CALC_FOUND_ROWS ", "").replace("SQL_CALC_FOUND_ROWS", "");
 
-        // Convert MySQL backslash-escaped quotes (\') to standard SQL doubled quotes ('')
-        s = s.replace("\\'", "''");
+        // MySqlDialect handles backslash escapes natively — no rewriting needed
 
         // For CREATE TABLE: strip table-level options AFTER the closing paren
         if s.to_uppercase().contains("CREATE TABLE") {

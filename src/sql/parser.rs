@@ -1,5 +1,5 @@
 use sqlparser::ast::{self as sp, ObjectNamePart, SelectItem, SetExpr, TableFactor, TopQuantity};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::error::{ForgeError, Result};
@@ -8,7 +8,7 @@ use crate::tuple::types::DataType;
 
 /// Parse a single SQL statement (Generic dialect for MySQL + T-SQL compat).
 pub fn parse(sql: &str) -> Result<Statement> {
-    let dialect = GenericDialect {};
+    let dialect = MySqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
         .map_err(|e| ForgeError::Parse(format!("{}", e)))?;
 

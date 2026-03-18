@@ -40,9 +40,10 @@ pub fn execute_index_scan(
             ForgeError::Execution(format!("index not found for {}", index_key))
         })?;
 
-    // Evaluate the lookup value using an empty tuple/schema since it should be a literal
+    // Evaluate the lookup value and coerce to match the index key type
     let empty_schema = Schema::new(vec![]);
     let key = evaluate(lookup_value, &[], &empty_schema)?;
+    let key = crate::tuple::tuple::coerce_value_pub(&key, &index.key_type);
 
     // Search index
     let rid = index.search(bpm, &key)?;

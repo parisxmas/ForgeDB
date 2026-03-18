@@ -19,14 +19,23 @@ pub fn execute_create_table(
     let columns: Vec<Column> = column_defs
         .iter()
         .enumerate()
-        .map(|(i, cd)| Column {
-            name: cd.name.clone(),
-            data_type: cd.data_type.clone(),
-            nullable: cd.nullable,
-            column_id: i as u16,
-            auto_increment: cd.auto_increment,
-            default_value: None,
-            is_primary_key: cd.is_primary_key,
+        .map(|(i, cd)| {
+            // Evaluate DEFAULT expression to a Value
+            let default_value = cd.default_value.as_ref().and_then(|expr| {
+                use crate::executor::eval::evaluate;
+                use crate::tuple::schema::Schema as S;
+                let empty = S::new(vec![]);
+                evaluate(expr, &[], &empty).ok()
+            });
+            Column {
+                name: cd.name.clone(),
+                data_type: cd.data_type.clone(),
+                nullable: cd.nullable,
+                column_id: i as u16,
+                auto_increment: cd.auto_increment,
+                default_value,
+                is_primary_key: cd.is_primary_key,
+            }
         })
         .collect();
     let schema = Schema::new(columns);

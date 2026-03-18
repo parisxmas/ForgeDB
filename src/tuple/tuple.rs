@@ -308,6 +308,11 @@ pub fn deserialize(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
 /// Coerce a value to match the expected column type.
 /// E.g. Integer(1) -> Boolean(true) for BIT columns,
 /// Integer(42) -> Float(42.0) for FLOAT columns.
+/// Public coercion for index lookups.
+pub fn coerce_value_pub(val: &Value, target: &DataType) -> Value {
+    coerce_value(val, target)
+}
+
 fn coerce_value(val: &Value, target: &DataType) -> Value {
     match (val, target) {
         // Integer -> Boolean (T-SQL BIT)
@@ -324,6 +329,22 @@ fn coerce_value(val: &Value, target: &DataType) -> Value {
         (Value::BigInt(n), DataType::DateTime) => Value::DateTime(*n),
         // Boolean -> Integer
         (Value::Boolean(b), DataType::Integer) => Value::Integer(if *b { 1 } else { 0 }),
+        // Varchar -> Integer (MySQL sends quoted numbers: '1', '0')
+        (Value::Varchar(s), DataType::Integer) => {
+            s.parse::<i32>().map(Value::Integer).unwrap_or(Value::Integer(0))
+        }
+        // Varchar -> BigInt
+        (Value::Varchar(s), DataType::BigInt) => {
+            s.parse::<i64>().map(Value::BigInt).unwrap_or(Value::BigInt(0))
+        }
+        // Varchar -> Float
+        (Value::Varchar(s), DataType::Float) => {
+            s.parse::<f64>().map(Value::Float).unwrap_or(Value::Float(0.0))
+        }
+        // Varchar -> Boolean
+        (Value::Varchar(s), DataType::Boolean) => {
+            Value::Boolean(s != "0" && !s.is_empty())
+        }
         // Varchar -> DateTime (parse "YYYY-MM-DD HH:MM:SS" to epoch)
         (Value::Varchar(s), DataType::DateTime) => {
             Value::DateTime(parse_datetime_string(s))
