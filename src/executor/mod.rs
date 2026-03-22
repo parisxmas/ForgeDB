@@ -16,6 +16,7 @@ pub mod projection;
 pub mod seq_scan;
 pub mod sort;
 pub mod temp_storage;
+pub mod vectorized;
 pub mod limit;
 pub mod update;
 pub mod drop_table;

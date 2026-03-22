@@ -503,6 +503,22 @@ pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResu
         }
     }
 
+    // ── Vectorized execution (batch processing) ─────────────────
+    // Process VECTOR_SIZE (1024) tuples per batch in columnar format.
+    // Fewer virtual dispatch calls, cache-friendly data layout.
+    // Falls through if the plan contains unsupported nodes.
+    {
+        let cbpm = ctx.bpm.get_cbpm();
+        if let Some(vec_result) = super::vectorized::try_build_vectorized(
+            &plan, ctx.catalog, cbpm, ctx.clustered_indexes, ctx.txn_ctx.as_ref(),
+        ) {
+            match vec_result {
+                Ok(mut op) => return super::vectorized::drain_vectorized(op.as_mut()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     // ── Volcano iterator fast path ────────────────────────────────
     // Streaming execution: pull one tuple at a time through the pipeline.
     // If the plan contains unsupported nodes (JOINs, IndexScan,
