@@ -128,19 +128,14 @@ pub fn count_tuples_fast(
             break;
         }
 
-        // Fetch + pin in the concurrent pool
-        cbpm.fetch_page(page_id)?;
-        let guard = cbpm.read_page(page_id)?;
+        // Direct read — single lock acquisition, no pin/unpin overhead
+        let guard = cbpm.read_page_direct(page_id)?;
         let data: &[u8; PAGE_SIZE] = guard.data();
 
         // Count live slots without reading tuple data
         count += heap_page::count_live_tuples(data) as i64;
 
-        let next = heap_page::get_next_page_id(data);
-        drop(guard);
-        cbpm.unpin_page(page_id, false)?;
-
-        page_id = PageId(next);
+        page_id = PageId(heap_page::get_next_page_id(data));
     }
 
     Ok(count)
@@ -162,8 +157,7 @@ fn count_tuples_mvcc(
             break;
         }
 
-        cbpm.fetch_page(page_id)?;
-        let guard = cbpm.read_page(page_id)?;
+        let guard = cbpm.read_page_direct(page_id)?;
         let data: &[u8; PAGE_SIZE] = guard.data();
 
         let num_slots = heap_page::get_num_slots(data);
@@ -189,13 +183,304 @@ fn count_tuples_mvcc(
         }
 
         let next = heap_page::get_next_page_id(data);
-        drop(guard);
-        cbpm.unpin_page(page_id, false)?;
 
         page_id = PageId(next);
     }
 
     Ok(count)
+}
+
+// =========================================================================
+// Fast aggregate path — SUM/MIN/MAX/AVG on a single column.
+// Bypasses LocalBpm and full tuple deserialization: reads pages directly
+// from ConcurrentBufferPool, extracts only the target column bytes using
+// deserialize_single_column(), and accumulates the aggregate incrementally.
+// =========================================================================
+
+/// Aggregate function type for the fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// Fast single-column aggregate that bypasses LocalBpm and full deserialization.
+/// Scans pages directly from ConcurrentBufferPool and reads only the target
+/// column using `deserialize_single_column()`.
+///
+/// For MVCC-enabled tables in auto-commit mode, skips deleted tuples (xmax != NONE).
+/// For MVCC tables inside explicit transactions, falls back to None (caller uses slow path).
+pub fn aggregate_column_fast(
+    table_name: &str,
+    catalog: &Catalog,
+    cbpm: &ConcurrentBufferPool,
+    col_name: &str,
+    agg_func: AggFunc,
+    txn_ctx: Option<&TxnContext>,
+) -> Result<Option<Value>> {
+    let info = catalog
+        .get_table(table_name)
+        .ok_or_else(|| ForgeError::Execution(format!("table '{}' not found", table_name)))?;
+
+    let schema = &info.schema;
+
+    // Find the column index
+    let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+        .ok_or_else(|| ForgeError::Execution(format!("column '{}' not found in '{}'", col_name, table_name)))?;
+
+    let mvcc_enabled = info.mvcc_enabled;
+
+    // For MVCC tables inside explicit transactions, fall back (need snapshot visibility)
+    if mvcc_enabled && txn_ctx.is_some() {
+        return Ok(None); // caller will use the slow path
+    }
+
+    let mut acc_int: Option<i64> = None;   // integer accumulator for SUM
+    let mut acc_float: Option<f64> = None; // float accumulator for SUM (used if any float value)
+    let mut is_float_sum = false;
+    let mut count: i64 = 0;
+    // For MIN/MAX we track the Value directly to preserve type
+    let mut min_val: Option<Value> = None;
+    let mut max_val: Option<Value> = None;
+
+    // SIMD batch buffer: collect i32 values from a page, then process in bulk.
+    // Avoids per-value branching in the tight loop and enables SIMD acceleration
+    // for SUM/MIN/MAX on integer columns.
+    let mut i32_batch: Vec<i32> = Vec::with_capacity(512);
+
+    let mut page_id = info.first_page_id;
+
+    loop {
+        if page_id.0 == INVALID_PAGE_ID {
+            break;
+        }
+
+        let guard = cbpm.read_page_direct(page_id)?;
+        let data: &[u8; PAGE_SIZE] = guard.data();
+
+        let num_slots = heap_page::get_num_slots(data);
+
+        // Clear batch buffer for this page
+        i32_batch.clear();
+        let mut use_batch = !is_float_sum; // Only batch if we're still in integer mode
+
+        for slot_id in 0..num_slots {
+            if let Some((off, len)) = heap_page::get_tuple_slice(data, slot_id) {
+                let raw = &data[off..off + len];
+
+                let tuple_data = if mvcc_enabled {
+                    if raw.len() < MVCC_HEADER_SIZE {
+                        continue;
+                    }
+                    let (_xmin, xmax) = decode_version_header(raw);
+                    // Auto-commit mode: skip deleted tuples
+                    if xmax != XMAX_NONE {
+                        continue;
+                    }
+                    &raw[MVCC_HEADER_SIZE..]
+                } else {
+                    raw
+                };
+
+                let val = crate::tuple::tuple::deserialize_single_column(tuple_data, schema, col_idx)?;
+                if matches!(val, Value::Null) {
+                    continue; // NULL values are ignored by aggregates
+                }
+
+                // Try to batch i32 values for SIMD processing
+                if use_batch {
+                    match &val {
+                        Value::Integer(n) => {
+                            i32_batch.push(*n);
+                            continue; // Skip per-value accumulation; batch below
+                        }
+                        _ => {
+                            // Non-integer value found: flush batch and fall back
+                            use_batch = false;
+                            // Flush accumulated i32 batch
+                            if !i32_batch.is_empty() {
+                                flush_i32_batch(
+                                    &i32_batch, agg_func,
+                                    &mut acc_int, &mut acc_float, &mut is_float_sum,
+                                    &mut count, &mut min_val, &mut max_val,
+                                );
+                                i32_batch.clear();
+                            }
+                        }
+                    }
+                }
+
+                // Per-value accumulation (scalar fallback)
+                match agg_func {
+                    AggFunc::Sum | AggFunc::Avg => {
+                        match &val {
+                            Value::Integer(n) if !is_float_sum => {
+                                acc_int = Some(acc_int.unwrap_or(0) + (*n as i64));
+                            }
+                            Value::BigInt(n) if !is_float_sum => {
+                                acc_int = Some(acc_int.unwrap_or(0) + n);
+                            }
+                            _ => {
+                                // Switch to float accumulation
+                                if !is_float_sum {
+                                    is_float_sum = true;
+                                    acc_float = Some(acc_int.unwrap_or(0) as f64);
+                                    acc_int = None;
+                                }
+                                acc_float = Some(acc_float.unwrap_or(0.0) + value_to_f64(&val));
+                            }
+                        }
+                        count += 1;
+                    }
+                    AggFunc::Min => {
+                        min_val = Some(match min_val {
+                            None => val,
+                            Some(cur) => if value_lt(&val, &cur) { val } else { cur },
+                        });
+                        count += 1;
+                    }
+                    AggFunc::Max => {
+                        max_val = Some(match max_val {
+                            None => val,
+                            Some(cur) => if value_gt(&val, &cur) { val } else { cur },
+                        });
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining batched i32 values from this page
+        if !i32_batch.is_empty() {
+            flush_i32_batch(
+                &i32_batch, agg_func,
+                &mut acc_int, &mut acc_float, &mut is_float_sum,
+                &mut count, &mut min_val, &mut max_val,
+            );
+            i32_batch.clear();
+        }
+
+        page_id = PageId(heap_page::get_next_page_id(data));
+    }
+
+    // Produce the result
+    if count == 0 {
+        return Ok(Some(Value::Null));
+    }
+
+    let result = match agg_func {
+        AggFunc::Sum => {
+            if is_float_sum {
+                let s = acc_float.unwrap_or(0.0);
+                Some(Value::Float(s))
+            } else {
+                let s = acc_int.unwrap_or(0);
+                // Preserve Integer type if the sum fits in i32
+                if s >= i32::MIN as i64 && s <= i32::MAX as i64 {
+                    Some(Value::Integer(s as i32))
+                } else {
+                    Some(Value::BigInt(s))
+                }
+            }
+        }
+        AggFunc::Avg => {
+            let s = if is_float_sum {
+                acc_float.unwrap_or(0.0)
+            } else {
+                acc_int.unwrap_or(0) as f64
+            };
+            Some(Value::Float(s / count as f64))
+        }
+        AggFunc::Min => Some(min_val.unwrap_or(Value::Null)),
+        AggFunc::Max => Some(max_val.unwrap_or(Value::Null)),
+    };
+
+    Ok(result)
+}
+
+/// Flush a batch of i32 values using SIMD-accelerated aggregation.
+/// This processes the entire batch at once using vectorized operations
+/// instead of per-value branching.
+#[inline]
+fn flush_i32_batch(
+    batch: &[i32],
+    agg_func: AggFunc,
+    acc_int: &mut Option<i64>,
+    _acc_float: &mut Option<f64>,
+    _is_float_sum: &mut bool,
+    count: &mut i64,
+    min_val: &mut Option<Value>,
+    max_val: &mut Option<Value>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    match agg_func {
+        AggFunc::Sum | AggFunc::Avg => {
+            let batch_sum = crate::executor::simd::sum_i32(batch);
+            *acc_int = Some(acc_int.unwrap_or(0) + batch_sum);
+            *count += batch.len() as i64;
+        }
+        AggFunc::Min => {
+            if let Some(batch_min) = crate::executor::simd::min_i32(batch) {
+                let batch_val = Value::Integer(batch_min);
+                *min_val = Some(match min_val.take() {
+                    None => batch_val,
+                    Some(cur) => if value_lt(&batch_val, &cur) { batch_val } else { cur },
+                });
+            }
+            *count += batch.len() as i64;
+        }
+        AggFunc::Max => {
+            if let Some(batch_max) = crate::executor::simd::max_i32(batch) {
+                let batch_val = Value::Integer(batch_max);
+                *max_val = Some(match max_val.take() {
+                    None => batch_val,
+                    Some(cur) => if value_gt(&batch_val, &cur) { batch_val } else { cur },
+                });
+            }
+            *count += batch.len() as i64;
+        }
+    }
+}
+
+/// Convert a Value to f64 for aggregate accumulation.
+#[inline]
+fn value_to_f64(val: &Value) -> f64 {
+    match val {
+        Value::Integer(n) => *n as f64,
+        Value::BigInt(n) => *n as f64,
+        Value::Float(f) => *f,
+        Value::Boolean(b) => if *b { 1.0 } else { 0.0 },
+        _ => 0.0,
+    }
+}
+
+/// Compare two Values: returns true if a < b.
+#[inline]
+fn value_lt(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x < y,
+        (Value::BigInt(x), Value::BigInt(y)) => x < y,
+        (Value::Float(x), Value::Float(y)) => x < y,
+        (Value::Integer(x), Value::BigInt(y)) => (*x as i64) < *y,
+        (Value::BigInt(x), Value::Integer(y)) => *x < (*y as i64),
+        (Value::Integer(x), Value::Float(y)) => (*x as f64) < *y,
+        (Value::Float(x), Value::Integer(y)) => *x < (*y as f64),
+        (Value::BigInt(x), Value::Float(y)) => (*x as f64) < *y,
+        (Value::Float(x), Value::BigInt(y)) => *x < (*y as f64),
+        (Value::Varchar(x), Value::Varchar(y)) => x < y,
+        _ => false,
+    }
+}
+
+/// Compare two Values: returns true if a > b.
+#[inline]
+fn value_gt(a: &Value, b: &Value) -> bool {
+    value_lt(b, a)
 }
 
 // =========================================================================

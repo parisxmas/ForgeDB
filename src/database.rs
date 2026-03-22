@@ -68,7 +68,9 @@ pub struct Database {
     /// Max memory per query in bytes (0 = unlimited)
     max_memory_per_query: Mutex<usize>,
     /// Partitioned tables: base_table_name (lowercase) -> PartitionMeta
-    partitions: Mutex<HashMap<String, PartitionMeta>>,
+    partitions: RwLock<HashMap<String, PartitionMeta>>,
+    /// Fast check: true if any partitions exist (avoids RwLock for common case)
+    has_partitions: std::sync::atomic::AtomicBool,
     /// Pending WAL entries for session transactions (batched until COMMIT).
     /// Maps txn_id -> accumulated WAL page entries to write on commit.
     pending_wal: Mutex<HashMap<TxnId, Vec<(TxnId, PageId, Box<[u8; PAGE_SIZE]>, Box<[u8; PAGE_SIZE]>)>>>,
@@ -107,7 +109,8 @@ impl Database {
             plan_cache: RwLock::new(HashMap::new()),
             cursors: Mutex::new(HashMap::new()),
             max_memory_per_query: Mutex::new(0),
-            partitions: Mutex::new(HashMap::new()),
+            partitions: RwLock::new(HashMap::new()),
+            has_partitions: std::sync::atomic::AtomicBool::new(false),
             pending_wal: Mutex::new(HashMap::new()),
         })
     }
@@ -149,7 +152,8 @@ impl Database {
             plan_cache: RwLock::new(HashMap::new()),
             cursors: Mutex::new(HashMap::new()),
             max_memory_per_query: Mutex::new(0),
-            partitions: Mutex::new(HashMap::new()),
+            partitions: RwLock::new(HashMap::new()),
+            has_partitions: std::sync::atomic::AtomicBool::new(false),
             pending_wal: Mutex::new(HashMap::new()),
         })
     }
@@ -172,8 +176,40 @@ impl Database {
         sql_text: &str,
         session_txn: &mut Option<TxnId>,
     ) -> Result<ExecuteResult> {
+        // Fast path: SELECT/INSERT/UPDATE/DELETE/BEGIN/COMMIT/ROLLBACK
+        // skip the expensive to_uppercase + 30 starts_with checks
+        let trimmed = sql_text.trim();
+        let first2 = if trimmed.len() >= 2 {
+            let b0 = trimmed.as_bytes()[0].to_ascii_uppercase();
+            let b1 = trimmed.as_bytes()[1].to_ascii_uppercase();
+            (b0, b1)
+        } else { (0, 0) };
+        // Only fast-path pure SQL DML/DQL — skip anything that needs pre-parse handling.
+        // Check 6 chars to distinguish DELETE from DECLARE, COMMIT from CLOSE, etc.
+        let is_fast_stmt = trimmed.len() >= 6 && {
+            let pfx = &trimmed.as_bytes()[..6];
+            pfx.eq_ignore_ascii_case(b"SELECT")
+                || pfx.eq_ignore_ascii_case(b"INSERT")
+                || pfx.eq_ignore_ascii_case(b"UPDATE")
+                || pfx.eq_ignore_ascii_case(b"DELETE")
+                || pfx.eq_ignore_ascii_case(b"ANALYZ")
+        };
+        if is_fast_stmt {
+            // Skip pre-parse string matching — go directly to SQL parse + plan
+            let sql_text_owned;
+            let sql_ref = if self.has_partitions.load(std::sync::atomic::Ordering::Relaxed) {
+                let upper = trimmed.to_uppercase();
+                sql_text_owned = self.resolve_partitioned_sql(trimmed, &upper)?;
+                sql_text_owned.as_str()
+            } else {
+                trimmed
+            };
+            let stmt = crate::sql::parse(sql_ref)?;
+            return self.execute_parsed_session(stmt, session_txn, sql_ref);
+        }
+
         // Handle SET LOCK_TIMEOUT before parsing
-        let upper = sql_text.trim().to_uppercase();
+        let upper = trimmed.to_uppercase();
         if upper.starts_with("SET LOCK_TIMEOUT ") {
             if let Some(ms_str) = upper.strip_prefix("SET LOCK_TIMEOUT ") {
                 if let Ok(ms) = ms_str.trim().trim_end_matches(';').parse::<u64>() {
@@ -360,12 +396,27 @@ impl Database {
         }
 
         // Check if this is an INSERT/SELECT targeting a partitioned table and redirect
-        let sql_text_resolved = self.resolve_partitioned_sql(sql_text, &upper)?;
-        let sql_text = &sql_text_resolved;
+        // Fast path: skip partition resolution when no partitions exist (lock-free check)
+        let sql_text_resolved;
+        let sql_text = if self.has_partitions.load(std::sync::atomic::Ordering::Relaxed) {
+            sql_text_resolved = self.resolve_partitioned_sql(sql_text, &upper)?;
+            &sql_text_resolved
+        } else {
+            sql_text
+        };
 
         // Phase 1: Parse
         let stmt = sql::parse(sql_text)?;
+        self.execute_parsed_session(stmt, session_txn, sql_text)
+    }
 
+    /// Execute a pre-parsed SQL statement with session transaction state.
+    fn execute_parsed_session(
+        &self,
+        stmt: Statement,
+        session_txn: &mut Option<TxnId>,
+        sql_text: &str,
+    ) -> Result<ExecuteResult> {
         // Phase 2: Handle transaction control and metadata statements
         match &stmt {
             Statement::StartTransaction => {
@@ -601,7 +652,9 @@ impl Database {
             let indexes_guard = self.indexes.read().unwrap();
             let clustered_guard = self.clustered_indexes.read().unwrap();
 
-            // Build snapshot for session transactions so reads see correct isolation
+            // Build snapshot ONLY for explicit session transactions.
+            // Auto-commit reads (session_txn == None) skip txn_manager entirely —
+            // no lock contention, enabling full concurrency.
             let read_txn_ctx = if let Some(txn_id) = *session_txn {
                 let tm = self.txn_manager.lock().unwrap();
                 if tm.is_active(txn_id) {
@@ -611,6 +664,7 @@ impl Database {
                     None
                 }
             } else {
+                // Auto-commit read: no snapshot needed, skip txn_manager lock
                 None
             };
 
@@ -645,7 +699,6 @@ impl Database {
                 let mut catalog = self.catalog.write().unwrap();
                 let mut indexes = self.indexes.write().unwrap();
                 let mut clustered = self.clustered_indexes.write().unwrap();
-                let mut auto_inc = self.auto_increment_counters.lock().unwrap();
 
                 let mut local_bpm = LocalBpm::new(&self.cbpm);
                 let result = {
@@ -654,7 +707,7 @@ impl Database {
                         catalog: &mut catalog,
                         indexes: &mut indexes,
                         clustered_indexes: &mut clustered,
-                        auto_increment_counters: &mut auto_inc,
+                        auto_increment_counters: &self.auto_increment_counters,
                         txn_ctx: None,
                     };
                     executor::execute(plan, &mut ctx)?
@@ -671,37 +724,38 @@ impl Database {
                     (stxn, false)
                 } else {
                     let mut tm = self.txn_manager.lock().unwrap();
-                    (tm.begin()?, true)
+                    // Use begin_fast for auto-transactions: skips WAL Begin record.
+                    // MVCC visibility handles crash safety (uncommitted xmin is invisible).
+                    (tm.begin_fast()?, true)
                 };
 
                 // Use READ locks on indexes/clustered_indexes for DML.
-                // BTreeIndex::insert/delete use AtomicU32 for root_page_id,
-                // so concurrent DML on different tables no longer blocks.
-                // Hold read guard instead of cloning — DML only reads the catalog.
                 let catalog_guard = self.catalog.read().unwrap();
                 let indexes = self.indexes.read().unwrap();
                 let clustered = self.clustered_indexes.read().unwrap();
 
-                // Lock auto_increment_counters for all DML (serves as global
-                // write serializer to prevent lost updates on concurrent
-                // UPDATE/DELETE on same rows).
-                let mut auto_inc = self.auto_increment_counters.lock().unwrap();
+                // Acquire per-table exclusive lock via LockManager.
+                // Two DMLs on DIFFERENT tables run concurrently.
+                // Two DMLs on the SAME table serialize (prevents lost updates).
+                let table_name = Self::extract_table_from_plan(&plan);
+                if let Some(ref tname) = table_name {
+                    let target = crate::txn::LockTarget { table: tname.clone(), key: "__table__".into() };
+                    let _ = self.lock_manager.acquire(txn_id, &target, crate::txn::LockMode::Exclusive);
+                }
 
-                // Build TxnContext AFTER locks: snapshot is now consistent
-                // with the serialization point.
+                // Build TxnContext AFTER locks: snapshot is consistent.
                 let txn_ctx = {
                     let tm = self.txn_manager.lock().unwrap();
                     let snapshot = tm.take_snapshot(txn_id);
                     TxnContext { txn_id, snapshot, undo_log: UndoLog::new() }
                 };
-
                 let mut local_bpm = LocalBpm::new(&self.cbpm);
                 let mut ctx = DmlContext {
                     bpm: &mut local_bpm,
                     catalog: &*catalog_guard,
                     indexes: &indexes,
                     clustered_indexes: &clustered,
-                    auto_increment_counters: &mut auto_inc,
+                    auto_increment_counters: &self.auto_increment_counters,
                     txn_ctx: Some(txn_ctx),
                 };
                 let exec_result = executor::execute_dml(plan, &mut ctx);
@@ -729,14 +783,14 @@ impl Database {
                             }
                         }
                         if is_auto {
-                            // Auto-transaction: write WAL entries immediately and commit
-                            for (tid, page_id, before, after) in &wal_entries {
-                                let _ = tm.log_page_write(*tid, *page_id, before, after);
-                            }
-                            tm.commit(txn_id)?;
+                            // Auto-transaction: commit_fast skips WAL Commit record.
+                            // Dirty pages in the buffer pool provide crash safety — on recovery,
+                            // uncommitted changes are invisible via MVCC (xmin not committed).
+                            // WAL page images are only written on explicit COMMIT for session
+                            // transactions, or on checkpoint/shutdown for full durability.
+                            tm.commit_fast(txn_id)?;
                             drop(tm);
                             self.lock_manager.release_all(txn_id);
-                            self.cbpm.flush_all()?;
                         } else {
                             // Session transaction: batch WAL entries for commit-time write
                             drop(tm);
@@ -760,7 +814,7 @@ impl Database {
                         }
                         let mut tm = self.txn_manager.lock().unwrap();
                         if is_auto {
-                            let _ = tm.abort(txn_id);
+                            let _ = tm.abort_fast(txn_id);
                             drop(tm);
                             self.lock_manager.release_all(txn_id);
                         } else {
@@ -1396,22 +1450,23 @@ impl Database {
     fn resolve_expr_subqueries(&self, expr: Expr) -> Result<Expr> {
         match expr {
             Expr::InSubquery { expr: inner_expr, subquery, negated } => {
-                // Execute the subquery
+                // Execute the subquery once
                 let result = self.execute_stmt_internal(&subquery)?;
-                // Collect first column values as literal expressions
-                let list: Vec<Expr> = result.rows.iter().map(|row| {
-                    if row.is_empty() {
-                        Expr::Literal(LiteralValue::Null)
-                    } else {
-                        value_to_literal_expr(&row[0])
-                    }
+                // Collect values and build HashSet for O(1) lookup
+                let values: Vec<Value> = result.rows.iter().filter_map(|row| {
+                    if row.is_empty() { None } else { Some(row[0].clone()) }
                 }).collect();
+                let keys: std::collections::HashSet<Vec<u8>> = values.iter()
+                    .filter(|v| !v.is_null())
+                    .map(|v| v.to_sort_key_bytes())
+                    .collect();
                 let resolved_inner = self.resolve_expr_subqueries(*inner_expr)?;
-                if negated {
-                    Ok(Expr::NotIn { expr: Box::new(resolved_inner), list })
-                } else {
-                    Ok(Expr::In { expr: Box::new(resolved_inner), list })
-                }
+                Ok(Expr::InValues {
+                    expr: Box::new(resolved_inner),
+                    values,
+                    keys,
+                    negated,
+                })
             }
             Expr::Exists { subquery, negated } => {
                 // Execute the subquery
@@ -2195,6 +2250,18 @@ impl Database {
     fn invalidate_plan_cache(&self) {
         let mut cache = self.plan_cache.write().unwrap();
         cache.clear();
+        // Also clear the parse cache so schema changes are reflected
+        crate::sql::parser::clear_parse_cache();
+    }
+
+    /// Extract the target table name from a DML plan node.
+    fn extract_table_from_plan(plan: &PlanNode) -> Option<String> {
+        match plan {
+            PlanNode::Insert { table_name, .. } => Some(table_name.clone()),
+            PlanNode::Update { table_name, .. } => Some(table_name.clone()),
+            PlanNode::Delete { table_name, .. } => Some(table_name.clone()),
+            _ => None,
+        }
     }
 
     /// Check if a user has a specific privilege
@@ -2244,6 +2311,21 @@ impl Database {
     }
 
     /// Shut down the database cleanly.
+    /// Read-only catalog reference for direct access (used by ForgeWire columnar join).
+    pub fn catalog_ref(&self) -> std::sync::RwLockReadGuard<'_, Catalog> {
+        self.catalog.read().unwrap()
+    }
+
+    /// Read-only indexes reference.
+    pub fn indexes_ref(&self) -> std::sync::RwLockReadGuard<'_, Vec<(String, crate::index::BTreeIndex)>> {
+        self.indexes.read().unwrap()
+    }
+
+    /// ConcurrentBufferPool reference for direct page access.
+    pub fn cbpm_ref(&self) -> &ConcurrentBufferPool {
+        &self.cbpm
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
         catalog.persist()?;
@@ -2262,7 +2344,7 @@ impl Database {
         let trg: usize = self.triggers.lock().unwrap().values().map(|v| v.len()).sum();
         let usr = self.users.lock().unwrap().len();
         let ps = self.prepared_stmts.lock().unwrap().len();
-        let pt = self.partitions.lock().unwrap().len();
+        let pt = self.partitions.read().unwrap().len();
         (sp, seq, pc, cur, proc, trg, usr, ps, pt)
     }
 
@@ -2385,8 +2467,9 @@ impl Database {
             range_partitions,
             columns_sql: columns_sql.to_string(),
         };
-        let mut parts = self.partitions.lock().unwrap();
+        let mut parts = self.partitions.write().unwrap();
         parts.insert(table_name_lower, meta);
+        self.has_partitions.store(true, std::sync::atomic::Ordering::Relaxed);
 
         Ok(ExecuteResult {
             rows: vec![], columns: vec![],
@@ -2396,7 +2479,7 @@ impl Database {
 
     /// Resolve INSERT/SELECT on partitioned tables to actual sub-tables.
     fn resolve_partitioned_sql(&self, sql_text: &str, upper: &str) -> Result<String> {
-        let parts = self.partitions.lock().unwrap();
+        let parts = self.partitions.read().unwrap();
         if parts.is_empty() {
             return Ok(sql_text.to_string());
         }

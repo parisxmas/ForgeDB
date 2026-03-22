@@ -20,42 +20,32 @@ pub fn evaluate(expr: &Expr, tuple: &[Value], schema: &Schema) -> Result<Value> 
             LiteralValue::Null => Ok(Value::Null),
         },
         Expr::ColumnRef { table, column } => {
-            // Resolve column with multiple fallback strategies
-            let col_lower = column.to_lowercase();
-            let idx = if let Some(tbl) = table {
-                let qualified = format!("{}.{}", tbl, column);
-                // 1. Exact qualified match
-                schema.get_column(&qualified).map(|(i, _)| i)
-                    // 2. Bare column name
-                    .or_else(|| schema.get_column(column).map(|(i, _)| i))
-                    // 3. Any column ending with .column
-                    .or_else(|| {
-                        let suffix = format!(".{}", col_lower);
-                        schema.columns.iter().enumerate()
-                            .find(|(_, c)| c.name.to_lowercase().ends_with(&suffix))
-                            .map(|(i, _)| i)
-                    })
-            } else {
-                // 1. Exact bare name
-                schema.get_column(column).map(|(i, _)| i)
-                    // 2. Any column ending with .column (prefixed schema)
-                    .or_else(|| {
-                        let suffix = format!(".{}", col_lower);
-                        schema.columns.iter().enumerate()
-                            .find(|(_, c)| c.name.to_lowercase().ends_with(&suffix))
-                            .map(|(i, _)| i)
-                    })
-                    // 3. Any column whose bare name (after .) matches
-                    .or_else(|| {
-                        schema.columns.iter().enumerate()
-                            .find(|(_, c)| {
-                                let name = c.name.to_lowercase();
-                                let bare = name.rsplit('.').next().unwrap_or(&name);
-                                bare == col_lower
-                            })
-                            .map(|(i, _)| i)
-                    })
-            };
+            // Fast path: try exact name match (zero allocation via eq_ignore_ascii_case)
+            let idx = schema.get_column(column).map(|(i, _)| i)
+                .or_else(|| {
+                    // Try qualified name
+                    if let Some(tbl) = table {
+                        let mut qualified = String::with_capacity(tbl.len() + 1 + column.len());
+                        qualified.push_str(tbl);
+                        qualified.push('.');
+                        qualified.push_str(column);
+                        schema.get_column(&qualified).map(|(i, _)| i)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    // Suffix match: column name after '.' matches
+                    schema.columns.iter().enumerate()
+                        .find(|(_, c)| {
+                            if let Some(dot) = c.name.rfind('.') {
+                                c.name[dot+1..].eq_ignore_ascii_case(column)
+                            } else {
+                                false
+                            }
+                        })
+                        .map(|(i, _)| i)
+                });
             let idx = idx.ok_or_else(|| {
                 ForgeError::Execution(format!("column '{}' not found in schema", column))
             })?;
@@ -864,6 +854,13 @@ pub fn evaluate(expr: &Expr, tuple: &[Value], schema: &Schema) -> Result<Value> 
                 _ => Err(ForgeError::Execution("NOT LIKE requires string operands".into())),
             }
         }
+        Expr::InValues { expr, keys, negated, .. } => {
+            let val = evaluate(expr, tuple, schema)?;
+            if val.is_null() { return Ok(Value::Null); }
+            let key = val.to_sort_key_bytes();
+            let found = keys.contains(&key);
+            Ok(Value::Boolean(if *negated { !found } else { found }))
+        }
         Expr::In { expr, list } => {
             let val = evaluate(expr, tuple, schema)?;
             if val.is_null() {
@@ -1063,9 +1060,14 @@ fn eval_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> Result<Va
             if left.is_null() || right.is_null() {
                 return Ok(Value::Null);
             }
-            // Coerce for cross-type comparisons (Boolean<->Integer, Integer<->Float)
-            let (l, r) = coerce_for_comparison(left, right);
-            let ordering = l.compare(&r).ok_or_else(|| {
+            // Fast path: Value::compare already handles cross-type promotion
+            // (Int<->Float, Int<->BigInt, etc.) — skip cloning via coerce_for_comparison
+            // when possible.
+            let ordering = left.compare(right).or_else(|| {
+                // Fallback: coerce for exotic cross-type pairs (Bool<->Int, DateTime<->Varchar)
+                let (l, r) = coerce_for_comparison(left, right);
+                l.compare(&r)
+            }).ok_or_else(|| {
                 ForgeError::Execution(format!("cannot compare {:?} with {:?}", left, right))
             })?;
             let result = match op {

@@ -173,22 +173,22 @@ pub fn execute_hash_join(
 
         match join_type {
             JoinType::Inner => {
+                // Pre-allocate a reusable buffer for combined rows
+                let mut combined = Vec::with_capacity(combined_width);
                 for (_, pvals) in probe_rows {
                     if probe_key_idx < pvals.len() {
                         let key = HashKey::from_value(&pvals[probe_key_idx]);
                         if let Some(indices) = hash_table.get(&key) {
                             for &bi in indices {
-                                let mut combined = Vec::with_capacity(combined_width);
+                                combined.clear();
                                 if build_is_left {
-                                    // build=left, probe=right
                                     combined.extend_from_slice(&build_rows[bi].1);
                                     combined.extend_from_slice(pvals);
                                 } else {
-                                    // build=right, probe=left
                                     combined.extend_from_slice(pvals);
                                     combined.extend_from_slice(&build_rows[bi].1);
                                 }
-                                result.push((dummy_rid, combined));
+                                result.push((dummy_rid, combined.clone()));
                             }
                         }
                     }

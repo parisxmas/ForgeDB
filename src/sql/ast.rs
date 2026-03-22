@@ -399,6 +399,15 @@ pub enum Expr {
         expr: Box<Expr>,
         list: Vec<Expr>,
     },
+    /// `expr IN (pre-computed value set)` — O(1) hash lookup.
+    /// Used when subquery results are inlined. The `keys` HashSet contains
+    /// sort-key-encoded values for O(1) membership testing.
+    InValues {
+        expr: Box<Expr>,
+        values: Vec<crate::tuple::types::Value>,
+        keys: std::collections::HashSet<Vec<u8>>,
+        negated: bool,
+    },
     /// `expr BETWEEN low AND high`
     Between {
         expr: Box<Expr>,

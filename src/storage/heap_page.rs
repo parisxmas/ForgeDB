@@ -116,16 +116,23 @@ fn set_slot(page: &mut [u8; PAGE_SIZE], slot_id: u16, offset: u16, length: u16) 
 /// deserializing or allocating Vec<u8> per tuple.
 ///
 /// A slot is considered deleted when its offset is 0.
+///
+/// On ARM64, uses NEON SIMD to check multiple slot offsets at once.
+/// On other architectures, uses a scalar loop written for auto-vectorization.
 pub fn count_live_tuples(page: &[u8; PAGE_SIZE]) -> u16 {
     let num_slots = get_num_slots(page);
-    let mut live = 0u16;
-    for slot_id in 0..num_slots {
-        let (offset, _length) = get_slot(page, slot_id);
-        if offset != 0 {
-            live += 1;
-        }
+    if num_slots == 0 {
+        return 0;
     }
-    live
+    // Use SIMD-accelerated slot counting.
+    // Slot entries are 4 bytes each (2-byte offset + 2-byte length),
+    // starting at HEADER_SIZE. We check the 2-byte offset at each entry.
+    crate::executor::simd::count_nonzero_slots(
+        page,
+        HEADER_SIZE,
+        SLOT_SIZE,
+        num_slots as usize,
+    )
 }
 
 // ── Public API ─────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ pub struct ExecutorContext<'a, 'b> {
     pub catalog: &'a mut Catalog,
     pub indexes: &'a mut Vec<(String, BTreeIndex)>,
     pub clustered_indexes: &'a mut std::collections::HashMap<String, ClusteredIndex>,
-    pub auto_increment_counters: &'a mut std::collections::HashMap<String, i64>,
+    pub auto_increment_counters: &'a std::sync::Mutex<std::collections::HashMap<String, i64>>,
     pub txn_ctx: Option<TxnContext>,
 }
 
@@ -36,7 +36,7 @@ pub struct DmlContext<'a, 'b> {
     pub catalog: &'a Catalog,
     pub indexes: &'a [(String, BTreeIndex)],
     pub clustered_indexes: &'a std::collections::HashMap<String, ClusteredIndex>,
-    pub auto_increment_counters: &'a mut std::collections::HashMap<String, i64>,
+    pub auto_increment_counters: &'a std::sync::Mutex<std::collections::HashMap<String, i64>>,
     pub txn_ctx: Option<TxnContext>,
 }
 
@@ -501,6 +501,10 @@ pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResu
         if let Some(fast_result) = try_count_star_fast(columns, child, ctx) {
             return fast_result;
         }
+        // ── Aggregate fast path: SUM/MIN/MAX/AVG on single columns ──
+        if let Some(fast_result) = try_aggregate_fast(columns, child, ctx) {
+            return fast_result;
+        }
     }
 
     // ── Vectorized execution (batch processing) ─────────────────
@@ -580,6 +584,10 @@ pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResu
             if let Some(fast_result) = try_count_star_fast(&columns, &*child, ctx) {
                 return fast_result;
             }
+            // ── Aggregate fast path: SUM/MIN/MAX/AVG ────────────────────
+            if let Some(fast_result) = try_aggregate_fast(&columns, &*child, ctx) {
+                return fast_result;
+            }
 
             let (schema, rows) = execute_read_scan(*child, ctx)?;
             if aggregate::has_aggregates(&columns) {
@@ -630,8 +638,46 @@ pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResu
         PlanNode::SeqScan { .. }
         | PlanNode::IndexScan { .. }
         | PlanNode::Filter { .. }
-        | PlanNode::NestedLoopJoin { .. }
         | PlanNode::HashJoin { .. } => {
+            let (schema, rows) = execute_read_scan(plan, ctx)?;
+            let col_names: Vec<String> = schema.columns.iter()
+                .map(|c| strip_table_prefix(&c.name))
+                .collect();
+            let value_rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, v)| v).collect();
+            Ok(ExecuteResult {
+                rows: value_rows, columns: col_names,
+                rows_affected: 0, last_insert_id: 0, message: String::new(),
+            })
+        }
+
+        // INNER JOIN at top level — try arena join first, then columnar
+        PlanNode::NestedLoopJoin { ref left, ref right, ref join_type, ref on } => {
+            if matches!(join_type, crate::sql::ast::JoinType::Inner) {
+                if let (PlanNode::SeqScan { table_name: lt, alias: la, .. },
+                        PlanNode::SeqScan { table_name: rt, alias: ra, .. }) = (left.as_ref(), right.as_ref()) {
+                    if let Some(on_expr) = on {
+                        if !ctx.clustered_indexes.contains_key(&lt.to_lowercase())
+                            && !ctx.clustered_indexes.contains_key(&rt.to_lowercase()) {
+                            let cbpm = ctx.bpm.get_cbpm();
+                            // Try arena join (PG-style, zero Value on hot path)
+                            if let Some(result) = super::arena_join::try_arena_join_result(
+                                lt, la.as_deref(), rt, ra.as_deref(),
+                                on_expr, ctx.catalog, cbpm,
+                            ) {
+                                return Ok(result);
+                            }
+                            // Fallback to columnar join
+                            if let Some(cr) = super::columnar_join::try_columnar_inner_join(
+                                lt, la.as_deref(), rt, ra.as_deref(),
+                                on_expr, ctx.catalog, cbpm, ctx.txn_ctx.as_ref(),
+                            ) {
+                                return Ok(super::columnar_join::columnar_to_execute_result(cr));
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback to materialization
             let (schema, rows) = execute_read_scan(plan, ctx)?;
             let col_names: Vec<String> = schema.columns.iter()
                 .map(|c| strip_table_prefix(&c.name))
@@ -647,6 +693,228 @@ pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResu
         other => Err(crate::error::ForgeError::Execution(format!(
             "write plan in read-only context: {:?}", other
         ))),
+    }
+}
+
+/// Fast INNER JOIN: bypass full materialization + hash_join module.
+/// Scans both sides directly from ConcurrentBufferPool, builds an integer-keyed
+/// hash map on the smaller side, probes with the larger side, emits matches.
+fn try_fast_inner_join(
+    left: &PlanNode,
+    right: &PlanNode,
+    on_expr: &crate::sql::ast::Expr,
+    ctx: &mut ReadContext,
+    cbpm: &crate::storage::concurrent_bpm::ConcurrentBufferPool,
+) -> Option<Result<(Schema, Vec<(RID, Vec<Value>)>)>> {
+    // Only handle SeqScan + SeqScan (no Filter, no clustered index)
+    let (left_table, left_alias) = match left {
+        PlanNode::SeqScan { table_name, alias, .. } => (table_name.as_str(), alias.as_deref()),
+        _ => return None,
+    };
+    let (right_table, right_alias) = match right {
+        PlanNode::SeqScan { table_name, alias, .. } => (table_name.as_str(), alias.as_deref()),
+        _ => return None,
+    };
+    // Skip clustered index tables
+    if ctx.clustered_indexes.contains_key(&left_table.to_lowercase())
+        || ctx.clustered_indexes.contains_key(&right_table.to_lowercase())
+    {
+        return None;
+    }
+
+    // Get schemas
+    let left_info = ctx.catalog.get_table(left_table)?;
+    let right_info = ctx.catalog.get_table(right_table)?;
+    let left_schema = left_info.schema.clone();
+    let right_schema = right_info.schema.clone();
+
+    // Extract equi-join key columns
+    let left_prefix = left_alias.unwrap_or(left_table);
+    let right_prefix = right_alias.unwrap_or(right_table);
+
+    let prefixed_left = Schema::new(left_schema.columns.iter().enumerate().map(|(i, c)| {
+        crate::tuple::schema::Column {
+            name: format!("{}.{}", left_prefix, c.name),
+            data_type: c.data_type.clone(), nullable: c.nullable, column_id: i as u16,
+            auto_increment: c.auto_increment, default_value: c.default_value.clone(),
+            is_primary_key: c.is_primary_key, is_unique: false, check_expr: None, fk_ref: None,
+        }
+    }).collect());
+    let prefixed_right = Schema::new(right_schema.columns.iter().enumerate().map(|(i, c)| {
+        crate::tuple::schema::Column {
+            name: format!("{}.{}", right_prefix, c.name),
+            data_type: c.data_type.clone(), nullable: c.nullable, column_id: i as u16,
+            auto_increment: c.auto_increment, default_value: c.default_value.clone(),
+            is_primary_key: c.is_primary_key, is_unique: false, check_expr: None, fk_ref: None,
+        }
+    }).collect());
+
+    let (left_key_idx, right_key_idx) = extract_equi_join_key_indices(on_expr, &prefixed_left, &prefixed_right)?;
+
+    // Scan build side (smaller) directly into hash map
+    let dummy_rid = RID { page_id: crate::common::PageId(0), slot_id: 0 };
+    let (build_rows, build_key_idx, probe_info, probe_schema, probe_key_idx, build_is_left) =
+        if right_info.schema.columns.len() <= left_info.schema.columns.len() {
+            let rows = match seq_scan::execute_seq_scan_direct(right_table, ctx.catalog, cbpm, None, ctx.txn_ctx.as_ref()) {
+                Ok((_, r)) => r, Err(e) => return Some(Err(e)),
+            };
+            (rows, right_key_idx, left_info, left_schema.clone(), left_key_idx, false)
+        } else {
+            let rows = match seq_scan::execute_seq_scan_direct(left_table, ctx.catalog, cbpm, None, ctx.txn_ctx.as_ref()) {
+                Ok((_, r)) => r, Err(e) => return Some(Err(e)),
+            };
+            (rows, left_key_idx, right_info, right_schema.clone(), right_key_idx, true)
+        };
+
+    // Build hash map: scan pages directly, extract only join key via single-column deserialize
+    let build_table = if build_is_left { left_table } else { right_table };
+    let build_info = ctx.catalog.get_table(build_table)?;
+    let build_schema_raw = build_info.schema.clone();
+    let build_mvcc = build_info.mvcc_enabled;
+
+    // Phase 1: scan build side — store raw bytes in a contiguous arena (one big Vec<u8>).
+    // Each tuple's bytes are appended with a 4-byte length prefix.
+    // The int_map maps join_key → list of (arena_offset, tuple_len).
+    let build_ncols = build_schema_raw.columns.len();
+    let mut arena: Vec<u8> = Vec::with_capacity(64 * 1024); // 64KB initial
+    let mut int_map: std::collections::HashMap<i64, Vec<(u32, u16)>> =
+        std::collections::HashMap::with_capacity(4096);
+    // Also pre-deserialize build side into a flat Value array for output.
+    // build_values[i * build_ncols .. (i+1) * build_ncols] = row i's Values.
+    let mut build_values: Vec<Value> = Vec::with_capacity(4096 * build_ncols);
+    let mut build_row_count: usize = 0;
+    {
+        let mut current_pid = build_info.first_page_id;
+        while current_pid.0 != crate::common::INVALID_PAGE_ID {
+            let pid = current_pid;
+            cbpm.fetch_page(pid).ok()?;
+            let guard = cbpm.read_page(pid).ok()?;
+            let num_slots = crate::storage::heap_page::get_num_slots(guard.data());
+            for slot in 0..num_slots {
+                if let Some((off, len)) = crate::storage::heap_page::get_tuple_slice(guard.data(), slot) {
+                    let raw = &guard.data()[off..off+len];
+                    let tuple_data = if build_mvcc && raw.len() >= crate::txn::mvcc::MVCC_HEADER_SIZE {
+                        let (_, xmax) = crate::txn::mvcc::decode_version_header(raw);
+                        if xmax != crate::txn::mvcc::XMAX_NONE { continue; }
+                        &raw[crate::txn::mvcc::MVCC_HEADER_SIZE..]
+                    } else { raw };
+                    if let Some(key) = crate::tuple::tuple::read_column_i64_raw(tuple_data, &build_schema_raw, build_key_idx) {
+                        // Deserialize build row once into the flat arena
+                        if let Ok(vals) = crate::tuple::tuple::deserialize(tuple_data, &build_schema_raw) {
+                            let row_idx = build_row_count;
+                            build_values.extend(vals);
+                            build_row_count += 1;
+                            int_map.entry(key).or_default().push((row_idx as u32, build_ncols as u16));
+                        }
+                    }
+                }
+            }
+            current_pid = crate::common::PageId(crate::storage::heap_page::get_next_page_id(guard.data()));
+            drop(guard);
+            cbpm.unpin_page(pid, false).ok();
+        }
+    }
+
+    // Phase 2: scan probe side, raw key probe, output via arena slicing.
+    let probe_table = if build_is_left { right_table } else { left_table };
+    let probe_info = ctx.catalog.get_table(probe_table)?;
+    let probe_schema_raw = probe_info.schema.clone();
+    let probe_mvcc = probe_info.mvcc_enabled;
+    let combined_width = left_schema.columns.len() + right_schema.columns.len();
+    // Pre-allocate result assuming ~50% match rate
+    let mut result: Vec<(RID, Vec<Value>)> = Vec::with_capacity(build_row_count);
+
+    {
+        let mut current_pid = probe_info.first_page_id;
+        while current_pid.0 != crate::common::INVALID_PAGE_ID {
+            let pid = current_pid;
+            cbpm.fetch_page(pid).ok()?;
+            let guard = cbpm.read_page(pid).ok()?;
+            let num_slots = crate::storage::heap_page::get_num_slots(guard.data());
+            for slot in 0..num_slots {
+                if let Some((off, len)) = crate::storage::heap_page::get_tuple_slice(guard.data(), slot) {
+                    let raw = &guard.data()[off..off+len];
+                    let tuple_data = if probe_mvcc && raw.len() >= crate::txn::mvcc::MVCC_HEADER_SIZE {
+                        let (_, xmax) = crate::txn::mvcc::decode_version_header(raw);
+                        if xmax != crate::txn::mvcc::XMAX_NONE { continue; }
+                        &raw[crate::txn::mvcc::MVCC_HEADER_SIZE..]
+                    } else { raw };
+                    if let Some(key) = crate::tuple::tuple::read_column_i64_raw(tuple_data, &probe_schema_raw, probe_key_idx) {
+                        if let Some(matches) = int_map.get(&key) {
+                            // Deserialize probe row once
+                            let probe_vals = match crate::tuple::tuple::deserialize(tuple_data, &probe_schema_raw) {
+                                Ok(v) => v, Err(_) => continue,
+                            };
+                            for &(row_idx, ncols) in matches {
+                                // Slice build values from the flat arena — no HashMap lookup
+                                let start = row_idx as usize * ncols as usize;
+                                let end = start + ncols as usize;
+                                let build_slice = &build_values[start..end];
+                                // Build output row
+                                let mut row = Vec::with_capacity(combined_width);
+                                if build_is_left {
+                                    row.extend_from_slice(build_slice);
+                                    row.extend_from_slice(&probe_vals);
+                                } else {
+                                    row.extend_from_slice(&probe_vals);
+                                    row.extend_from_slice(build_slice);
+                                }
+                                result.push((dummy_rid, row));
+                            }
+                        }
+                    }
+                }
+            }
+            current_pid = crate::common::PageId(crate::storage::heap_page::get_next_page_id(guard.data()));
+            drop(guard);
+            cbpm.unpin_page(pid, false).ok();
+        }
+    }
+
+    let combined_schema = hash_join::build_combined_schema_pub(&prefixed_left, &prefixed_right);
+    Some(Ok((combined_schema, result)))
+}
+
+/// Like execute_read_scan but uses direct ConcurrentBufferPool access for SeqScan
+/// to avoid LocalBpm page copies. Falls back to execute_read_scan for non-SeqScan nodes.
+fn execute_read_scan_direct(
+    plan: PlanNode,
+    ctx: &mut ReadContext,
+    cbpm: &crate::storage::concurrent_bpm::ConcurrentBufferPool,
+) -> Result<(Schema, Vec<(RID, Vec<Value>)>)> {
+    match plan {
+        PlanNode::SeqScan { ref table_name, ref alias, .. } if table_name != "__dual__" => {
+            // Skip clustered index tables — they need LocalBpm
+            if ctx.clustered_indexes.contains_key(&table_name.to_lowercase()) {
+                return execute_read_scan(plan, ctx);
+            }
+            let prefix = alias.as_deref().unwrap_or(table_name);
+            let (schema, rows) = seq_scan::execute_seq_scan_direct(
+                table_name, ctx.catalog, cbpm, None, ctx.txn_ctx.as_ref(),
+            )?;
+            let prefixed = Schema::new(
+                schema.columns.iter().enumerate().map(|(i, c)| {
+                    crate::tuple::schema::Column {
+                        name: format!("{}.{}", prefix, c.name),
+                        data_type: c.data_type.clone(),
+                        nullable: c.nullable,
+                        column_id: i as u16,
+                        auto_increment: c.auto_increment,
+                        default_value: c.default_value.clone(),
+                        is_primary_key: c.is_primary_key,
+                        is_unique: false,
+                        check_expr: None, fk_ref: None,
+                    }
+                }).collect(),
+            );
+            Ok((prefixed, rows))
+        }
+        PlanNode::Filter { predicate, child } => {
+            let (schema, rows) = execute_read_scan_direct(*child, ctx, cbpm)?;
+            let filtered = filter::execute_filter(&predicate, rows, &schema)?;
+            Ok((schema, filtered))
+        }
+        other => execute_read_scan(other, ctx),
     }
 }
 
@@ -720,8 +988,18 @@ fn execute_read_scan(
             Ok((schema, filtered))
         }
         PlanNode::NestedLoopJoin { left, right, join_type, on } => {
-            let (left_schema, left_rows) = execute_read_scan(*left, ctx)?;
-            let (right_schema, right_rows) = execute_read_scan(*right, ctx)?;
+            // Fast INNER JOIN: use direct scan + integer hash for equi-joins
+            if matches!(join_type, crate::sql::ast::JoinType::Inner) {
+                if let Some(ref on_expr) = on {
+                    let cbpm = ctx.bpm.get_cbpm();
+                    if let Some(result) = try_fast_inner_join(&*left, &*right, on_expr, ctx, cbpm) {
+                        return result;
+                    }
+                }
+            }
+            let cbpm = ctx.bpm.get_cbpm();
+            let (left_schema, left_rows) = execute_read_scan_direct(*left, ctx, cbpm)?;
+            let (right_schema, right_rows) = execute_read_scan_direct(*right, ctx, cbpm)?;
 
             // Auto-select grace hash join for large datasets
             if left_rows.len() > grace_hash_join::HASH_JOIN_MEMORY_LIMIT
@@ -1224,5 +1502,119 @@ fn format_count_star_name(expr: &Expr) -> String {
             }
         }
         _ => "COUNT(*)".to_string(),
+    }
+}
+
+// =========================================================================
+// Aggregate fast-path: SUM/MIN/MAX/AVG on a single column, no WHERE/GROUP BY
+// =========================================================================
+
+/// Try to execute a fast-path aggregate for `SELECT AGG(col) FROM table`.
+/// Handles single or multiple aggregate columns (all must be simple single-column
+/// aggregates on the same table with no WHERE or GROUP BY).
+///
+/// Returns `None` if the pattern doesn't match.
+fn try_aggregate_fast(
+    columns: &[SelectColumn],
+    child: &PlanNode,
+    ctx: &mut ReadContext,
+) -> Option<Result<ExecuteResult>> {
+    // Child must be a bare SeqScan (no Filter)
+    let table_name = match child {
+        PlanNode::SeqScan { table_name, .. } => {
+            if table_name == "__dual__" {
+                return None;
+            }
+            table_name
+        }
+        _ => return None,
+    };
+
+    if columns.is_empty() {
+        return None;
+    }
+
+    // Parse each column — must be a simple aggregate function on a column ref
+    let mut agg_specs: Vec<(String, seq_scan::AggFunc, String)> = Vec::new(); // (display_name, func, col_name)
+
+    for col in columns {
+        match col {
+            SelectColumn::Expr { expr, alias } => {
+                if let Some((func, col_name)) = extract_simple_aggregate(expr) {
+                    let display = alias.clone().unwrap_or_else(|| format_agg_name(expr));
+                    agg_specs.push((display, func, col_name));
+                } else {
+                    return None; // not a simple aggregate
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    // Execute each aggregate via the fast path
+    let cbpm = ctx.bpm.get_cbpm();
+    let mut col_names = Vec::with_capacity(agg_specs.len());
+    let mut row = Vec::with_capacity(agg_specs.len());
+
+    for (display, func, col_name) in &agg_specs {
+        col_names.push(display.clone());
+        match seq_scan::aggregate_column_fast(
+            table_name, ctx.catalog, cbpm, col_name, *func, ctx.txn_ctx.as_ref(),
+        ) {
+            Ok(Some(val)) => row.push(val),
+            Ok(None) => return None, // fast path not applicable (e.g., MVCC with txn)
+            Err(e) => return Some(Err(e)),
+        }
+    }
+
+    Some(Ok(ExecuteResult {
+        rows: vec![row],
+        columns: col_names,
+        rows_affected: 0,
+        last_insert_id: 0,
+        message: String::new(),
+    }))
+}
+
+/// Extract (AggFunc, column_name) from a simple aggregate expression like SUM(col).
+/// Returns None for COUNT(*), DISTINCT aggregates, or anything complex.
+fn extract_simple_aggregate(expr: &Expr) -> Option<(seq_scan::AggFunc, String)> {
+    match expr {
+        Expr::Function { name, args, distinct } => {
+            if *distinct {
+                return None;
+            }
+            let func = match name.to_uppercase().as_str() {
+                "SUM" => seq_scan::AggFunc::Sum,
+                "MIN" => seq_scan::AggFunc::Min,
+                "MAX" => seq_scan::AggFunc::Max,
+                "AVG" => seq_scan::AggFunc::Avg,
+                _ => return None,
+            };
+            // Must have exactly one argument that is a column reference
+            if args.len() != 1 {
+                return None;
+            }
+            match &args[0] {
+                Expr::ColumnRef { column, .. } => Some((func, column.clone())),
+                _ => return None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build a display name for an aggregate expression.
+fn format_agg_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Function { name, args, .. } => {
+            if args.is_empty() {
+                format!("{}(*)", name)
+            } else {
+                let arg_strs: Vec<String> = args.iter().map(|a| format!("{:?}", a)).collect();
+                format!("{}({})", name, arg_strs.join(", "))
+            }
+        }
+        _ => "?".to_string(),
     }
 }

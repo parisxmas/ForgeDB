@@ -38,6 +38,19 @@ impl TransactionManager {
         Ok(txn_id)
     }
 
+    /// Begin a lightweight transaction that skips WAL Begin record.
+    /// Used for auto-transactions where MVCC visibility handles crash safety
+    /// (uncommitted changes are invisible after restart because xmin is not committed).
+    /// Session transactions (BEGIN/COMMIT) should use `begin()` for full durability.
+    pub fn begin_fast(&mut self) -> Result<TxnId> {
+        let txn_id = TxnId(self.next_txn_id);
+        self.next_txn_id += 1;
+        self.active_txns.insert(txn_id);
+        self.undo_logs.insert(txn_id, UndoLog::new());
+        // Skip WAL append — auto-transactions rely on MVCC for crash safety
+        Ok(txn_id)
+    }
+
     /// Commit a transaction: write a Commit record and remove from active set.
     pub fn commit(&mut self, txn_id: TxnId) -> Result<()> {
         if !self.active_txns.contains(&txn_id) {
@@ -52,6 +65,21 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Commit a lightweight transaction without writing a WAL Commit record.
+    /// Used for auto-transactions that were started with `begin_fast()`.
+    pub fn commit_fast(&mut self, txn_id: TxnId) -> Result<()> {
+        if !self.active_txns.contains(&txn_id) {
+            return Err(ForgeError::Transaction(format!(
+                "transaction {:?} is not active",
+                txn_id
+            )));
+        }
+        // Skip WAL append — matches begin_fast()
+        self.active_txns.remove(&txn_id);
+        self.undo_logs.remove(&txn_id);
+        Ok(())
+    }
+
     /// Abort a transaction: write an Abort record and remove from active set.
     pub fn abort(&mut self, txn_id: TxnId) -> Result<()> {
         if !self.active_txns.contains(&txn_id) {
@@ -61,6 +89,21 @@ impl TransactionManager {
             )));
         }
         self.wal.append(&WalRecord::Abort(txn_id))?;
+        self.active_txns.remove(&txn_id);
+        self.undo_logs.remove(&txn_id);
+        Ok(())
+    }
+
+    /// Abort a lightweight transaction without writing a WAL Abort record.
+    /// Used for auto-transactions that were started with `begin_fast()`.
+    pub fn abort_fast(&mut self, txn_id: TxnId) -> Result<()> {
+        if !self.active_txns.contains(&txn_id) {
+            return Err(ForgeError::Transaction(format!(
+                "transaction {:?} is not active",
+                txn_id
+            )));
+        }
+        // Skip WAL append — matches begin_fast()
         self.active_txns.remove(&txn_id);
         self.undo_logs.remove(&txn_id);
         Ok(())

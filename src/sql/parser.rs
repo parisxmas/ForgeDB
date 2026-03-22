@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::RwLock;
+
 use sqlparser::ast::{self as sp, ObjectNamePart, SelectItem, SetExpr, TableFactor, TopQuantity};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -6,8 +10,58 @@ use crate::error::{ForgeError, Result};
 use crate::sql::ast::*;
 use crate::tuple::types::DataType;
 
+// =========================================================================
+// Statement-level parse cache — avoids re-parsing identical SQL strings.
+// Thread-safe via RwLock: concurrent readers don't block each other.
+// Bounded at 50K entries; cleared entirely when full (simple eviction).
+// =========================================================================
+
+static PARSE_CACHE: std::sync::LazyLock<RwLock<HashMap<u64, Statement>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::with_capacity(1024)));
+
+/// Hash SQL text using the standard hasher (fast for short strings).
+fn hash_sql(sql: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Parse a single SQL statement (Generic dialect for MySQL + T-SQL compat).
+/// Uses a global parse cache to avoid re-parsing identical SQL strings.
 pub fn parse(sql: &str) -> Result<Statement> {
+    // Compute hash for cache lookup
+    let hash = hash_sql(sql);
+
+    // Check parse cache (read lock — concurrent readers don't block)
+    if let Ok(cache) = PARSE_CACHE.read() {
+        if let Some(cached) = cache.get(&hash) {
+            return Ok(cached.clone());
+        }
+    }
+
+    // Cache miss — parse normally
+    let stmt = parse_uncached(sql)?;
+
+    // Store in cache (write lock — brief)
+    if let Ok(mut cache) = PARSE_CACHE.write() {
+        if cache.len() >= 50_000 {
+            cache.clear();
+        }
+        cache.insert(hash, stmt.clone());
+    }
+
+    Ok(stmt)
+}
+
+/// Clear the parse cache (e.g., on schema changes).
+pub fn clear_parse_cache() {
+    if let Ok(mut cache) = PARSE_CACHE.write() {
+        cache.clear();
+    }
+}
+
+/// Parse without cache — the actual parsing logic.
+fn parse_uncached(sql: &str) -> Result<Statement> {
     // Fast-path: try lightweight INSERT parser to bypass sqlparser overhead
     if let Some(stmt) = try_fast_parse_insert(sql) {
         return Ok(stmt);

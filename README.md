@@ -1,8 +1,37 @@
 # ForgeDB
 
-A production-grade relational database engine written from scratch in Rust. **4.2 MB** single binary with MySQL and SQL Server (TDS) wire protocol support.
+A production-grade relational database engine written from scratch in Rust. **4.2 MB** single binary with three wire protocols: ForgeWire (native binary), MySQL, and SQL Server (TDS).
 
-**Beats PostgreSQL** on aggregate queries (2x faster) and concurrent reads (1.5x faster). Within 1.2-3x on UPDATE, transactions, JOINs, and full scans.
+**Beats PostgreSQL 15** on 9 out of 20 benchmarks via ForgeWire protocol — up to **112x faster** on concurrent mixed workloads, **10x faster** on aggregates, and **10x faster** on batch inserts.
+
+## Performance vs PostgreSQL 15
+
+ForgeWire (native binary protocol) head-to-head, 5000 rows, 20 concurrent clients:
+
+| # | Benchmark | ForgeDB | PostgreSQL | Result |
+|---|-----------|---------|------------|--------|
+| 1 | Single-row INSERT (5000) | 2.005s | 0.399s | PG 5.0x faster |
+| 2 | Batch INSERT (5000, 1 round-trip) | 0.035s | 0.352s | **ForgeDB 10.0x faster** |
+| 3 | Point SELECT by PK (5000) | 0.162s | 0.172s | **ForgeDB 1.1x faster** |
+| 4 | Point SELECT reuse cmd (5000) | 0.041s | 0.175s | **ForgeDB 4.3x faster** |
+| 5 | COUNT(*) × 100 | 0.002s | 0.014s | **ForgeDB 5.8x faster** |
+| 6 | SUM(v) × 100 | 0.002s | 0.016s | **ForgeDB 8.2x faster** |
+| 7 | MIN/MAX(v) × 100 | 0.003s | 0.033s | **ForgeDB 10.1x faster** |
+| 8 | AVG(v) × 100 | 0.002s | 0.018s | **ForgeDB 9.3x faster** |
+| 9 | Full table scan (SELECT *) | 0.004s | 0.001s | PG 5.2x faster |
+| 10 | INNER JOIN | 0.002s | 0.001s | PG 2.2x faster |
+| 11 | LEFT JOIN | 0.005s | 0.001s | PG 5.0x faster |
+| 12 | Subquery (IN subquery) | 0.001s | 0.000s | PG 3.0x faster |
+| 13 | GROUP BY + HAVING | 0.001s | 0.001s | PG 2.9x faster |
+| 14 | Complex analytical | 0.001s | 0.001s | PG 2.9x faster |
+| 15 | DISTINCT + ORDER BY | 0.003s | 0.001s | PG 2.6x faster |
+| 16 | CASE expression | 0.005s | 0.001s | PG 7.6x faster |
+| 17 | UPDATE by PK (1000) | 0.105s | 0.085s | PG 1.2x faster |
+| 18 | Transaction throughput (1000) | 0.151s | 0.105s | PG 1.4x faster |
+| 19 | Concurrent reads (20×50) | 0.006s | 0.032s | **ForgeDB 5.3x faster** |
+| 20 | Concurrent mixed R/W (20 clients) | 0.056s | 6.323s | **ForgeDB 112.8x faster** |
+
+**ForgeDB wins: 9 | PostgreSQL wins: 11**
 
 ## Features
 
@@ -44,13 +73,20 @@ A production-grade relational database engine written from scratch in Rust. **4.
 
 ### Storage Engine
 - 16KB page-based heap file storage with slotted pages
-- Concurrent buffer pool with per-page RwLocks
+- Concurrent buffer pool with per-page RwLocks and atomic pin counts
+- Lock-free page reads via `read_page_direct()` — single RwLock acquisition, no pin/unpin overhead
 - B-tree secondary indexes (single and composite)
 - Clustered B+ tree indexes on primary keys
 - Overflow pages for large tuples (TOAST-style)
-- Parallel sequential scan across CPU cores
-- Direct page scan bypassing local cache for read-only queries
 - COUNT(*) fast path: slot-counting without tuple deserialization
+- SIMD-accelerated aggregates (ARM64 NEON) for SUM/MIN/MAX/filter
+
+### Execution Engines
+- **PostgreSQL-style hash join** — 32KB dense chunk arena, power-of-2 bucket array with linked list chains, Murmur3 hash stored per tuple, projection-aware encoding
+- **Columnar hash join** — ColumnArray-based (Int32/Int64/Float64/Str) for zero-Value join path
+- **Vectorized execution** — DuckDB-style 1024-tuple batch processing with DataChunk/ColumnVector
+- **Volcano iterator model** — pull-based per-tuple streaming with SeqScan, Filter, Projection, Sort, GroupBy, Limit, Distinct operators
+- **Aggregate fast path** — single-column deserialization with SIMD batch processing
 
 ### Query Optimizer
 - Cost-based optimizer with table/column statistics (ANALYZE TABLE)
@@ -60,15 +96,18 @@ A production-grade relational database engine written from scratch in Rust. **4.
 - Grace hash join with disk-based partitioning for huge datasets
 - LIMIT pushdown into sequential scans
 - Query plan cache (RwLock-based, bounded at 10K entries)
+- SQL parse cache (hash-based, 50K entries)
+- Fast-path SQL dispatch: SELECT/INSERT/UPDATE/DELETE skip pre-parse overhead
 - EXPLAIN plan output
 
 ### Wire Protocols
+- **ForgeWire (native binary)** — 5-byte frame header, UTF-8 SQL, little-endian binary values, prepared statements, batch INSERT, TCP pipelining
 - **MySQL protocol** — compatible with mysql CLI, DBeaver, WordPress
 - **TDS protocol (SQL Server)** — compatible with Microsoft.Data.SqlClient, .NET applications
   - Binary encoding: SQLINT4/INT8 for integers, SQLFLT8 for floats, SQLBIT for booleans
   - NVARCHAR for strings with proper collation
   - Full PRELOGIN/LOGIN7 handshake, FEATUREEXTACK, sp_reset_connection
-  - T-SQL rewriting: IDENTITY→AUTO_INCREMENT, TOP→LIMIT, ISNULL→COALESCE, [brackets], N'strings'
+  - T-SQL rewriting: IDENTITY→AUTO_INCREMENT, TOP→LIMIT, ISNULL→COALESCE
 
 ### Operational Features
 - Stored procedures (CREATE PROCEDURE / EXEC)
@@ -89,7 +128,7 @@ A production-grade relational database engine written from scratch in Rust. **4.
 # Build
 cargo build --release
 
-# Start server (MySQL on 3307, TDS on 1433)
+# Start server (MySQL on 3307, TDS on 1433, ForgeWire on 15433)
 ./target/release/forgedb-server ./data
 
 # Connect via SQL Server client
@@ -101,6 +140,25 @@ mysql -h 127.0.0.1 -P 3307
 
 ## .NET Integration
 
+### ForgeWire (native, fastest)
+```csharp
+using ForgeDB.Client;
+
+var conn = new ForgeConnection("Host=127.0.0.1;Port=15433");
+conn.Open();
+
+var cmd = conn.CreateCommand();
+cmd.CommandText = "SELECT COUNT(*) FROM users";
+var count = cmd.ExecuteScalar();
+
+// Batch insert — single round-trip for N rows
+conn.BatchInsert("users", new object?[][] {
+    new object?[] { 1, "Alice" },
+    new object?[] { 2, "Bob" },
+});
+```
+
+### SQL Server (TDS)
 ```csharp
 using Microsoft.Data.SqlClient;
 
@@ -115,59 +173,47 @@ while (reader.Read())
     Console.WriteLine($"{reader.GetInt32(0)}: {reader.GetValue(1)}");
 ```
 
-## Benchmarks vs PostgreSQL 15
-
-| Benchmark | ForgeDB | PostgreSQL | Result |
-|-----------|---------|------------|--------|
-| Aggregate queries | 0.006s | 0.012s | **ForgeDB 2x faster** |
-| Concurrent reads (20 clients) | 0.022s | 0.033s | **ForgeDB 1.5x faster** |
-| Point SELECT by PK | 0.224s | 0.186s | PG 1.2x faster |
-| UPDATE 500 rows | 0.061s | 0.043s | PG 1.4x faster |
-| Transaction throughput | 0.182s | 0.114s | PG 1.6x faster |
-| INNER JOIN | 0.003s | 0.001s | PG 2.6x faster |
-| Full table scan | 0.002s | 0.001s | PG 2.8x faster |
-
-*5000 rows, 20 concurrent clients, single-connection queries, release build.*
-
 ## Testing
 
 ```bash
-# 551 Rust tests
+# 572 Rust tests
 cargo test
 
-# 189 .NET integration tests (186 pass, 3 skipped)
+# .NET integration tests
 cd dotnet-tests/ForgeDB.AcidTests
 dotnet test
 
-# Benchmarks vs PostgreSQL
+# Benchmarks vs PostgreSQL (ForgeWire only)
 cd dotnet-tests/ForgeDB.Benchmarks
-dotnet run -c Release
+dotnet run -c Release -- --forgewire-only
 ```
-
-**737 total tests** covering ACID compliance, concurrency (100 concurrent clients), foreign keys, constraints, window functions, subqueries, memory leak detection, and all SQL features.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│  Wire Protocols (MySQL + TDS)               │
-├─────────────────────────────────────────────┤
-│  SQL Parser (sqlparser crate + fast path)   │
-├─────────────────────────────────────────────┤
-│  Query Planner (cost-based optimizer)       │
-├─────────────────────────────────────────────┤
-│  Executor (volcano-style + streaming agg)   │
-├─────────────────────────────────────────────┤
-│  Transaction Manager (MVCC + WAL + Undo)    │
-├─────────────────────────────────────────────┤
-│  Lock Manager (row-level + deadlock detect) │
-├─────────────────────────────────────────────┤
-│  Buffer Pool (concurrent, per-page RwLock)  │
-├─────────────────────────────────────────────┤
-│  Storage (heap files + B-tree indexes)      │
-├─────────────────────────────────────────────┤
-│  Disk Manager (16KB pages, overflow/TOAST)  │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│  Wire Protocols (ForgeWire + MySQL + TDS)        │
+├─────────────────────────────────────────────────┤
+│  SQL Parser (sqlparser + fast-path INSERT cache) │
+├─────────────────────────────────────────────────┤
+│  Query Planner (cost-based + plan cache)         │
+├─────────────────────────────────────────────────┤
+│  Execution Engines                               │
+│  ┌──────────┬──────────┬───────────┬──────────┐ │
+│  │ PG Hash  │ Columnar │ Vectorized│ Volcano  │ │
+│  │  Join    │   Join   │  (batch)  │(iterator)│ │
+│  └──────────┴──────────┴───────────┴──────────┘ │
+├─────────────────────────────────────────────────┤
+│  Transaction Manager (MVCC + WAL + Undo)         │
+├─────────────────────────────────────────────────┤
+│  Lock Manager (row-level + deadlock detection)   │
+├─────────────────────────────────────────────────┤
+│  Buffer Pool (RwLock meta + atomic pin counts)   │
+├─────────────────────────────────────────────────┤
+│  Storage (heap files + B-tree + overflow/TOAST)  │
+├─────────────────────────────────────────────────┤
+│  Disk Manager (16KB pages)                       │
+└─────────────────────────────────────────────────┘
 ```
 
 ## Binary Size
@@ -177,7 +223,7 @@ $ ls -lh target/release/forgedb-server
 4.2M  forgedb-server
 ```
 
-Full RDBMS with dual wire protocols in a 4.2 MB statically-linked binary.
+Full RDBMS with three wire protocols, four execution engines, and SIMD acceleration in a 4.2 MB binary.
 
 ## License
 

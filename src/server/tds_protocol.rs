@@ -138,6 +138,45 @@ impl TdsServer {
 }
 
 // ---------------------------------------------------------------------------
+// RPC parameter value (parsed from TDS RPC payload)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum RpcParamValue {
+    Null,
+    Int(i32),
+    BigInt(i64),
+    Float(f64),
+    Bit(bool),
+    NVarchar(String),
+}
+
+impl RpcParamValue {
+    /// Convert to a SQL literal string for parameter substitution.
+    fn to_sql_literal(&self) -> String {
+        match self {
+            RpcParamValue::Null => "NULL".to_string(),
+            RpcParamValue::Int(v) => v.to_string(),
+            RpcParamValue::BigInt(v) => v.to_string(),
+            RpcParamValue::Float(v) => {
+                // Ensure we don't lose precision for whole numbers
+                if *v == (*v as i64) as f64 && v.abs() < i64::MAX as f64 {
+                    format!("{}.0", *v as i64)
+                } else {
+                    format!("{}", v)
+                }
+            }
+            RpcParamValue::Bit(v) => if *v { "1".to_string() } else { "0".to_string() },
+            RpcParamValue::NVarchar(s) => {
+                // Escape single quotes inside the string
+                let escaped = s.replace('\'', "''");
+                format!("'{}'", escaped)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TdsConnection
 // ---------------------------------------------------------------------------
 
@@ -148,6 +187,10 @@ struct TdsConnection {
     conn_id: u32,
     current_txn_id: Option<crate::common::TxnId>,
     packet_id: u8,
+    /// Prepared statement handle counter
+    next_prep_handle: i32,
+    /// Maps prepared statement handle -> SQL text
+    prepared_stmts: HashMap<i32, String>,
 }
 
 impl TdsConnection {
@@ -160,6 +203,8 @@ impl TdsConnection {
             conn_id,
             current_txn_id: None,
             packet_id: 1,
+            next_prep_handle: 1,
+            prepared_stmts: HashMap::new(),
         })
     }
 
@@ -233,12 +278,7 @@ impl TdsConnection {
             match pkt_type {
                 TDS_SQL_BATCH => self.handle_sql_batch(&payload)?,
                 TDS_RPC => {
-                    // RPC request — typically sp_reset_connection from connection pooling.
-                    // Respond with ENVCHANGE (packet size) + DONE to satisfy the client.
-                    let mut resp = Vec::new();
-                    Self::append_envchange_packet_size(&mut resp, "4096");
-                    resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
-                    self.write_packet(TDS_RESPONSE, &resp)?;
+                    self.handle_rpc(&payload)?;
                 }
                 TDS_TRANS_MGR_REQ => {
                     // Transaction manager request — send DONE.
@@ -339,11 +379,16 @@ impl TdsConnection {
         // Build login response: ENVCHANGE + LOGINACK + DONE
         let mut resp = Vec::new();
 
-        // ENVCHANGE: database
+        // ENVCHANGE: database (type 1)
         Self::append_envchange_database(&mut resp, "forgedb");
 
-        // ENVCHANGE: packet size
+        // ENVCHANGE: packet size (type 4)
         Self::append_envchange_packet_size(&mut resp, "4096");
+
+        // ENVCHANGE: collation (type 7) — required for SqlClient MetaType resolution
+        // Without this, parameterized queries crash with NullReferenceException
+        // Collation: Latin1_General_CI_AS = 0x0904D00034
+        Self::append_envchange_collation(&mut resp);
 
         // LOGINACK
         Self::append_loginack(&mut resp, &client_tds_ver);
@@ -384,16 +429,809 @@ impl TdsConnection {
     }
 
     // -----------------------------------------------------------------------
+    // RPC handling (sp_executesql, sp_prepare, sp_execute, sp_unprepare)
+    // -----------------------------------------------------------------------
+
+    fn handle_rpc(&mut self, payload: &[u8]) -> io::Result<()> {
+        let data = Self::skip_all_headers(payload);
+
+        if data.len() < 4 {
+            // Too short — send DONE
+            let mut resp = Vec::new();
+            Self::append_envchange_packet_size(&mut resp, "4096");
+            resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+            self.write_packet(TDS_RESPONSE, &resp)?;
+            return Ok(());
+        }
+
+        // Parse procedure ID or name
+        let (proc_id, rest) = Self::parse_rpc_proc_id(data);
+
+        // Skip OptionFlags (2 bytes)
+        let params_data = if rest.len() >= 2 { &rest[2..] } else { rest };
+
+        match proc_id {
+            10 => self.handle_sp_executesql(params_data),
+            11 => self.handle_sp_prepare(params_data),
+            12 => self.handle_sp_execute(params_data),
+            13 => self.handle_sp_unprepare(params_data),
+            _ => {
+                // Unknown RPC (e.g. sp_reset_connection) — send ENVCHANGE + DONE
+                let mut resp = Vec::new();
+                Self::append_envchange_packet_size(&mut resp, "4096");
+                resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+                self.write_packet(TDS_RESPONSE, &resp)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Parse the RPC procedure identifier from the payload.
+    /// Returns (proc_id, remaining_data).
+    /// proc_id: 10=sp_executesql, 11=sp_prepare, 12=sp_execute, 13=sp_unprepare
+    /// Returns 0 for unknown procedures.
+    fn parse_rpc_proc_id(data: &[u8]) -> (u16, &[u8]) {
+        if data.len() < 2 {
+            return (0, data);
+        }
+
+        let name_len = u16::from_le_bytes([data[0], data[1]]);
+
+        if name_len == 0xFFFF {
+            // ProcID follows as u16 LE
+            if data.len() >= 4 {
+                let id = u16::from_le_bytes([data[2], data[3]]);
+                (id, &data[4..])
+            } else {
+                (0, data)
+            }
+        } else {
+            // Named procedure: name_len chars of UTF-16LE
+            let name_bytes = (name_len as usize) * 2;
+            if data.len() >= 2 + name_bytes {
+                let name_data = &data[2..2 + name_bytes];
+                let name = Self::decode_utf16le(name_data).to_lowercase();
+                let rest = &data[2 + name_bytes..];
+
+                let id = match name.as_str() {
+                    "sp_executesql" => 10,
+                    "sp_prepare" => 11,
+                    "sp_execute" => 12,
+                    "sp_unprepare" => 13,
+                    _ => 0,
+                };
+                (id, rest)
+            } else {
+                (0, data)
+            }
+        }
+    }
+
+    /// Parse a single RPC parameter from the data stream.
+    /// Returns (param_value, remaining_data).
+    fn parse_rpc_param<'a>(data: &'a [u8]) -> Option<(RpcParamValue, &'a [u8])> {
+        if data.is_empty() {
+            return None;
+        }
+
+        let mut pos = 0;
+
+        // ParamName: B_VARCHAR (1 byte length in chars, then UTF-16LE)
+        if pos >= data.len() { return None; }
+        let name_len = data[pos] as usize;
+        pos += 1;
+        // Skip param name (name_len * 2 bytes of UTF-16LE)
+        pos += name_len * 2;
+        if pos > data.len() { return None; }
+
+        // StatusFlags: 1 byte
+        if pos >= data.len() { return None; }
+        let _status = data[pos];
+        pos += 1;
+
+        // TypeInfo
+        if pos >= data.len() { return None; }
+        let type_id = data[pos];
+        pos += 1;
+
+        match type_id {
+            // INTN (0x26) — nullable integer
+            TDS_TYPE_INTN => {
+                if pos >= data.len() { return None; }
+                let max_len = data[pos] as usize;
+                pos += 1;
+                // Value: 1-byte actual length + data
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    let val = match actual_len {
+                        4 => {
+                            let v = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                            RpcParamValue::Int(v)
+                        }
+                        8 => {
+                            let mut bytes = [0u8; 8];
+                            bytes.copy_from_slice(&data[pos..pos+8]);
+                            let v = i64::from_le_bytes(bytes);
+                            RpcParamValue::BigInt(v)
+                        }
+                        2 => {
+                            let v = i16::from_le_bytes([data[pos], data[pos+1]]);
+                            RpcParamValue::Int(v as i32)
+                        }
+                        1 => {
+                            RpcParamValue::Int(data[pos] as i32)
+                        }
+                        _ => RpcParamValue::Null,
+                    };
+                    pos += actual_len;
+                    Some((val, &data[pos..]))
+                }
+            }
+            // BITN (0x68) — nullable bit
+            TDS_TYPE_BITN => {
+                if pos >= data.len() { return None; }
+                let _max_len = data[pos];
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos >= data.len() { return None; }
+                    let v = data[pos] != 0;
+                    pos += actual_len;
+                    Some((RpcParamValue::Bit(v), &data[pos..]))
+                }
+            }
+            // FLTN (0x6D) — nullable float
+            TDS_TYPE_FLTN => {
+                if pos >= data.len() { return None; }
+                let _max_len = data[pos];
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    let val = if actual_len == 8 {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&data[pos..pos+8]);
+                        RpcParamValue::Float(f64::from_le_bytes(bytes))
+                    } else if actual_len == 4 {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&data[pos..pos+4]);
+                        RpcParamValue::Float(f32::from_le_bytes(bytes) as f64)
+                    } else {
+                        RpcParamValue::Null
+                    };
+                    pos += actual_len;
+                    Some((val, &data[pos..]))
+                }
+            }
+            // NVARCHAR (0xE7) — Unicode string
+            TDS_TYPE_NVARCHAR => {
+                // MaxLength: 2 bytes LE
+                if pos + 2 > data.len() { return None; }
+                let max_len = u16::from_le_bytes([data[pos], data[pos+1]]);
+                pos += 2;
+                // Collation: 5 bytes
+                if pos + 5 > data.len() { return None; }
+                pos += 5;
+                // Value: 2-byte length + UTF-16LE data
+                if pos + 2 > data.len() { return None; }
+                let actual_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                pos += 2;
+                if actual_len == 0xFFFF {
+                    // NULL
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    let s = Self::decode_utf16le(&data[pos..pos+actual_len]);
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar(s), &data[pos..]))
+                }
+            }
+            // BIGVARCHAR (0xA7) — non-Unicode string
+            TDS_TYPE_BIGVARCHAR => {
+                // MaxLength: 2 bytes LE
+                if pos + 2 > data.len() { return None; }
+                let _max_len = u16::from_le_bytes([data[pos], data[pos+1]]);
+                pos += 2;
+                // Collation: 5 bytes
+                if pos + 5 > data.len() { return None; }
+                pos += 5;
+                // Value: 2-byte length + data
+                if pos + 2 > data.len() { return None; }
+                let actual_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                pos += 2;
+                if actual_len == 0xFFFF {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    let s = String::from_utf8_lossy(&data[pos..pos+actual_len]).to_string();
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar(s), &data[pos..]))
+                }
+            }
+            // NTEXT/TEXT (0x63) — large text type used by some drivers
+            0x63 => {
+                // Skip: 4 byte maxlen + 5 byte collation
+                if pos + 9 > data.len() { return None; }
+                pos += 4 + 5;
+                // Value: 4 byte text pointer length
+                if pos + 4 > data.len() { return None; }
+                let tp_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                pos += 4;
+                if tp_len == 0 || tp_len == 0xFFFFFFFF {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    // Skip text pointer + timestamp
+                    pos += tp_len;
+                    if pos + 8 > data.len() { return None; }
+                    pos += 8; // timestamp
+                    // actual data length
+                    if pos + 4 > data.len() { return None; }
+                    let data_len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                    pos += 4;
+                    if pos + data_len > data.len() { return None; }
+                    let s = Self::decode_utf16le(&data[pos..pos+data_len]);
+                    pos += data_len;
+                    Some((RpcParamValue::NVarchar(s), &data[pos..]))
+                }
+            }
+            // DATETIMEN (0x6F) — nullable datetime
+            0x6F => {
+                if pos >= data.len() { return None; }
+                let max_len = data[pos] as usize;
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    // Skip datetime bytes
+                    if pos + actual_len > data.len() { return None; }
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar("0".to_string()), &data[pos..]))
+                }
+            }
+            // MONEYN (0x6E) — nullable money
+            0x6E => {
+                if pos >= data.len() { return None; }
+                let _max_len = data[pos];
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    pos += actual_len;
+                    Some((RpcParamValue::Float(0.0), &data[pos..]))
+                }
+            }
+            // DECIMALN/NUMERICN (0x6A/0x6C) — nullable decimal
+            0x6A | 0x6C => {
+                if pos + 2 > data.len() { return None; }
+                let _max_len = data[pos];
+                let _precision = data[pos + 1];
+                pos += 2;
+                if pos >= data.len() { return None; }
+                let _scale = data[pos];
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    // Parse decimal: first byte is sign (1=positive, 0=negative)
+                    // remaining bytes are the integer value in LE
+                    if actual_len >= 2 {
+                        let sign = data[pos];
+                        let int_bytes = &data[pos+1..pos+actual_len];
+                        let mut val: i128 = 0;
+                        for (i, &b) in int_bytes.iter().enumerate() {
+                            val |= (b as i128) << (i * 8);
+                        }
+                        if sign == 0 { val = -val; }
+                        // Convert to float, applying scale
+                        let scale_factor = 10f64.powi(_scale as i32);
+                        let fval = (val as f64) / scale_factor;
+                        pos += actual_len;
+                        Some((RpcParamValue::Float(fval), &data[pos..]))
+                    } else {
+                        pos += actual_len;
+                        Some((RpcParamValue::Float(0.0), &data[pos..]))
+                    }
+                }
+            }
+            // UNIQUEIDENTIFIER (0x24) — nullable GUID
+            0x24 => {
+                if pos >= data.len() { return None; }
+                let _max_len = data[pos];
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    // Format as GUID string
+                    if actual_len == 16 {
+                        let d = &data[pos..pos+16];
+                        let guid = format!(
+                            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            d[3], d[2], d[1], d[0], d[5], d[4], d[7], d[6],
+                            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]
+                        );
+                        pos += actual_len;
+                        Some((RpcParamValue::NVarchar(guid), &data[pos..]))
+                    } else {
+                        pos += actual_len;
+                        Some((RpcParamValue::Null, &data[pos..]))
+                    }
+                }
+            }
+            // BIGVARBINARY (0xAD) — variable-length binary
+            0xAD => {
+                if pos + 2 > data.len() { return None; }
+                let _max_len = u16::from_le_bytes([data[pos], data[pos+1]]);
+                pos += 2;
+                if pos + 2 > data.len() { return None; }
+                let actual_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                pos += 2;
+                if actual_len == 0xFFFF {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    // Represent as hex string
+                    let hex: String = data[pos..pos+actual_len].iter()
+                        .map(|b| format!("{:02X}", b)).collect();
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar(format!("X'{}'", hex)), &data[pos..]))
+                }
+            }
+            // Fixed-length types (no max_len byte in TypeInfo)
+            TDS_TYPE_INT4 => {
+                // Fixed 4-byte integer
+                if pos + 4 > data.len() { return None; }
+                let v = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                pos += 4;
+                Some((RpcParamValue::Int(v), &data[pos..]))
+            }
+            TDS_TYPE_INT8 => {
+                if pos + 8 > data.len() { return None; }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&data[pos..pos+8]);
+                let v = i64::from_le_bytes(bytes);
+                pos += 8;
+                Some((RpcParamValue::BigInt(v), &data[pos..]))
+            }
+            TDS_TYPE_FLT8 => {
+                if pos + 8 > data.len() { return None; }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&data[pos..pos+8]);
+                let v = f64::from_le_bytes(bytes);
+                pos += 8;
+                Some((RpcParamValue::Float(v), &data[pos..]))
+            }
+            TDS_TYPE_BIT => {
+                if pos >= data.len() { return None; }
+                let v = data[pos] != 0;
+                pos += 1;
+                Some((RpcParamValue::Bit(v), &data[pos..]))
+            }
+            // BIGCHAR (0xAF) — fixed-length non-Unicode string
+            0xAF => {
+                if pos + 2 > data.len() { return None; }
+                let _max_len = u16::from_le_bytes([data[pos], data[pos+1]]);
+                pos += 2;
+                if pos + 5 > data.len() { return None; }
+                pos += 5; // collation
+                if pos + 2 > data.len() { return None; }
+                let actual_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                pos += 2;
+                if actual_len == 0xFFFF {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    let s = String::from_utf8_lossy(&data[pos..pos+actual_len]).to_string();
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar(s), &data[pos..]))
+                }
+            }
+            // DATE (0x28) — 3-byte date
+            0x28 => {
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar("0".to_string()), &data[pos..]))
+                }
+            }
+            // TIME (0x29), DATETIME2 (0x2A), DATETIMEOFFSET (0x2B)
+            0x29 | 0x2A | 0x2B => {
+                // These have a scale byte in TypeInfo
+                if pos >= data.len() { return None; }
+                let _scale = data[pos];
+                pos += 1;
+                if pos >= data.len() { return None; }
+                let actual_len = data[pos] as usize;
+                pos += 1;
+                if actual_len == 0 {
+                    Some((RpcParamValue::Null, &data[pos..]))
+                } else {
+                    if pos + actual_len > data.len() { return None; }
+                    pos += actual_len;
+                    Some((RpcParamValue::NVarchar("0".to_string()), &data[pos..]))
+                }
+            }
+            _ => {
+                // Unknown type — try to skip gracefully
+                // For BYTELEN types (variable length with 1-byte max), try that pattern
+                None
+            }
+        }
+    }
+
+    /// Parse all RPC parameters from the data stream.
+    fn parse_all_rpc_params(data: &[u8]) -> Vec<RpcParamValue> {
+        let mut params = Vec::new();
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            match Self::parse_rpc_param(remaining) {
+                Some((val, rest)) => {
+                    params.push(val);
+                    remaining = rest;
+                }
+                None => break,
+            }
+        }
+        params
+    }
+
+    /// sp_executesql: one-shot parameterized query.
+    /// Params: [0] = SQL text, [1] = param definitions (optional), [2..] = param values
+    fn handle_sp_executesql(&mut self, params_data: &[u8]) -> io::Result<()> {
+        let params = Self::parse_all_rpc_params(params_data);
+
+        let sql_template = match params.get(0) {
+            Some(RpcParamValue::NVarchar(s)) => s.clone(),
+            _ => {
+                let mut resp = Vec::new();
+                Self::append_error(&mut resp, 50000, "sp_executesql: missing SQL parameter");
+                resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+                self.write_packet(TDS_RESPONSE, &resp)?;
+                return Ok(());
+            }
+        };
+
+        // Substitute parameters into the SQL template
+        let final_sql = if params.len() > 2 {
+            // params[1] = param definitions like "@p1 int, @p2 nvarchar(100)"
+            // params[2..] = param values in order
+            let param_defs = match params.get(1) {
+                Some(RpcParamValue::NVarchar(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let param_names = Self::parse_param_definitions(&param_defs);
+            Self::substitute_params(&sql_template, &param_names, &params[2..])
+        } else {
+            sql_template
+        };
+
+        // Execute using the SQL batch path (rewriting, interception, etc.)
+        self.execute_rpc_sql(&final_sql)
+    }
+
+    /// sp_prepare: store SQL template, return handle.
+    fn handle_sp_prepare(&mut self, params_data: &[u8]) -> io::Result<()> {
+        let params = Self::parse_all_rpc_params(params_data);
+
+        // sp_prepare params: [0] = handle (output), [1] = param definitions, [2] = SQL text
+        // Or sometimes: [0] = param definitions, [1] = SQL text (handle returned as output)
+        // SqlClient sends: @handle OUTPUT (int), @params nvarchar, @stmt nvarchar
+        let sql_text = if params.len() >= 3 {
+            match params.get(2) {
+                Some(RpcParamValue::NVarchar(s)) => s.clone(),
+                _ => match params.get(1) {
+                    Some(RpcParamValue::NVarchar(s)) => s.clone(),
+                    _ => String::new(),
+                },
+            }
+        } else if params.len() >= 2 {
+            match params.get(1) {
+                Some(RpcParamValue::NVarchar(s)) => s.clone(),
+                _ => match params.get(0) {
+                    Some(RpcParamValue::NVarchar(s)) => s.clone(),
+                    _ => String::new(),
+                },
+            }
+        } else if params.len() == 1 {
+            match params.get(0) {
+                Some(RpcParamValue::NVarchar(s)) => s.clone(),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        let handle = self.next_prep_handle;
+        self.next_prep_handle += 1;
+        self.prepared_stmts.insert(handle, sql_text);
+
+        // Response: RETURNSTATUS(0) + result set with handle + DONEPROC
+        let mut resp = Vec::new();
+
+        // TOKEN_RETURNSTATUS (0x79) — return value = 0 (success)
+        resp.push(0x79);
+        resp.extend_from_slice(&0i32.to_le_bytes());
+
+        // Return the handle as a single-column, single-row result set
+        // This is what SqlClient reads via ExecuteScalar()
+        let cols = vec!["handle".to_string()];
+        let rows = vec![vec![Value::Integer(handle)]];
+        Self::append_result_set(&mut resp, &cols, &rows);
+
+        // DONEPROC instead of DONE for RPC results
+        resp.push(TOKEN_DONEPROC);
+        resp.extend_from_slice(&(DONE_FINAL | DONE_COUNT).to_le_bytes());
+        resp.extend_from_slice(&0u16.to_le_bytes()); // CurCmd
+        resp.extend_from_slice(&1i64.to_le_bytes()); // RowCount
+
+        self.write_packet(TDS_RESPONSE, &resp)?;
+        Ok(())
+    }
+
+    /// sp_execute: look up prepared handle, substitute params, execute.
+    fn handle_sp_execute(&mut self, params_data: &[u8]) -> io::Result<()> {
+        let params = Self::parse_all_rpc_params(params_data);
+
+        // First param is the handle (INT)
+        let handle = match params.get(0) {
+            Some(RpcParamValue::Int(h)) => *h,
+            Some(RpcParamValue::BigInt(h)) => *h as i32,
+            _ => {
+                let mut resp = Vec::new();
+                Self::append_error(&mut resp, 50000, "sp_execute: invalid handle");
+                resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+                self.write_packet(TDS_RESPONSE, &resp)?;
+                return Ok(());
+            }
+        };
+
+        let sql_template = match self.prepared_stmts.get(&handle) {
+            Some(s) => s.clone(),
+            None => {
+                let mut resp = Vec::new();
+                Self::append_error(&mut resp, 50000, &format!("sp_execute: handle {} not found", handle));
+                resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+                self.write_packet(TDS_RESPONSE, &resp)?;
+                return Ok(());
+            }
+        };
+
+        // Remaining params are the parameter values.
+        // We need to extract parameter names from the SQL template (@p1, @p2, etc.)
+        let param_names = Self::extract_param_names_from_sql(&sql_template);
+        let final_sql = if params.len() > 1 {
+            Self::substitute_params(&sql_template, &param_names, &params[1..])
+        } else {
+            sql_template
+        };
+
+        self.execute_rpc_sql(&final_sql)
+    }
+
+    /// sp_unprepare: remove a prepared statement handle.
+    fn handle_sp_unprepare(&mut self, params_data: &[u8]) -> io::Result<()> {
+        let params = Self::parse_all_rpc_params(params_data);
+
+        if let Some(RpcParamValue::Int(handle)) = params.get(0) {
+            self.prepared_stmts.remove(handle);
+        } else if let Some(RpcParamValue::BigInt(handle)) = params.get(0) {
+            self.prepared_stmts.remove(&(*handle as i32));
+        }
+
+        // Send RETURNSTATUS(0) + DONEPROC
+        let mut resp = Vec::new();
+        resp.push(0x79); // TOKEN_RETURNSTATUS
+        resp.extend_from_slice(&0i32.to_le_bytes());
+        resp.push(TOKEN_DONEPROC);
+        resp.extend_from_slice(&DONE_FINAL.to_le_bytes());
+        resp.extend_from_slice(&0u16.to_le_bytes());
+        resp.extend_from_slice(&0i64.to_le_bytes());
+
+        self.write_packet(TDS_RESPONSE, &resp)?;
+        Ok(())
+    }
+
+    /// Execute SQL from an RPC call (with T-SQL rewriting and interception).
+    fn execute_rpc_sql(&mut self, sql: &str) -> io::Result<()> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+            self.write_packet(TDS_RESPONSE, &resp)?;
+            return Ok(());
+        }
+
+        // Split on semicolons (same as SQL batch)
+        let statements: Vec<&str> = if sql.contains(';') {
+            sql.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+        } else {
+            vec![sql]
+        };
+
+        let mut resp = Vec::new();
+
+        for &trimmed in &statements {
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Intercept T-SQL system queries
+            if let Some(intercept_resp) = self.try_intercept_tds(trimmed) {
+                resp.extend_from_slice(&intercept_resp);
+                continue;
+            }
+
+            // Rewrite T-SQL
+            let rewritten = Self::rewrite_tsql(trimmed);
+
+            // Rewrite temp tables
+            let final_sql = if rewritten.contains('#') {
+                Self::rewrite_temp_tables(&rewritten, self.conn_id)
+            } else {
+                rewritten
+            };
+
+            let result = self.db.execute_sql_session(&final_sql, &mut self.current_txn_id);
+
+            match result {
+                Ok(exec_result) => {
+                    if exec_result.columns.is_empty() {
+                        resp.extend_from_slice(&Self::build_done(
+                            DONE_FINAL | DONE_COUNT, exec_result.rows_affected as i64));
+                    } else {
+                        Self::append_result_set(&mut resp, &exec_result.columns, &exec_result.rows);
+                        resp.extend_from_slice(&Self::build_done(
+                            DONE_FINAL | DONE_COUNT, exec_result.rows.len() as i64));
+                    }
+                }
+                Err(e) => {
+                    Self::append_error(&mut resp, 50000, &format!("{}", e));
+                    resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+                }
+            }
+        }
+
+        if resp.is_empty() {
+            resp.extend_from_slice(&Self::build_done(DONE_FINAL, 0));
+        }
+
+        self.write_packet(TDS_RESPONSE, &resp)?;
+        Ok(())
+    }
+
+    /// Parse parameter definitions string like "@p1 int, @p2 nvarchar(100)"
+    /// Returns a list of parameter names in order.
+    fn parse_param_definitions(defs: &str) -> Vec<String> {
+        if defs.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut names = Vec::new();
+        for part in defs.split(',') {
+            let trimmed = part.trim();
+            // First token is the parameter name (e.g. "@p1")
+            if let Some(name) = trimmed.split_whitespace().next() {
+                names.push(name.to_string());
+            }
+        }
+        names
+    }
+
+    /// Extract @-parameter names from a SQL template by scanning for @name patterns.
+    fn extract_param_names_from_sql(sql: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let chars: Vec<char> = sql.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '@' && i + 1 < chars.len() && (chars[i+1].is_alphanumeric() || chars[i+1] == '_') {
+                // Not @@ (system variable)
+                if i + 1 < chars.len() && chars[i+1] == '@' {
+                    i += 2;
+                    continue;
+                }
+                let start = i;
+                i += 1;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                if !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    names.push(name);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        names
+    }
+
+    /// Substitute @param_name placeholders with actual values in the SQL string.
+    fn substitute_params(sql: &str, param_names: &[String], param_values: &[RpcParamValue]) -> String {
+        let mut result = sql.to_string();
+
+        // Sort param names by length descending to avoid partial replacements
+        // e.g. @p10 should be replaced before @p1
+        let mut indexed: Vec<(usize, &String)> = param_names.iter().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+        for (idx, name) in indexed {
+            if idx < param_values.len() {
+                let replacement = param_values[idx].to_sql_literal();
+                // Replace all occurrences of the parameter name
+                // We need to be careful not to replace partial matches
+                // e.g. @p1 should not be replaced inside @p10
+                let mut new_result = String::with_capacity(result.len());
+                let name_chars: Vec<char> = name.chars().collect();
+                let result_chars: Vec<char> = result.chars().collect();
+                let mut i = 0;
+                while i < result_chars.len() {
+                    if i + name_chars.len() <= result_chars.len() {
+                        let slice: String = result_chars[i..i+name_chars.len()].iter().collect();
+                        if slice.eq_ignore_ascii_case(name) {
+                            // Check that the next character is NOT alphanumeric or underscore
+                            let next_is_word = if i + name_chars.len() < result_chars.len() {
+                                let c = result_chars[i + name_chars.len()];
+                                c.is_alphanumeric() || c == '_'
+                            } else {
+                                false
+                            };
+                            if !next_is_word {
+                                new_result.push_str(&replacement);
+                                i += name_chars.len();
+                                continue;
+                            }
+                        }
+                    }
+                    new_result.push(result_chars[i]);
+                    i += 1;
+                }
+                result = new_result;
+            }
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
     // SQL Batch
     // -----------------------------------------------------------------------
 
     fn handle_sql_batch(&mut self, payload: &[u8]) -> io::Result<()> {
-        // SQL batch: payload is UTF-16LE SQL text
-        // First check for ALL_HEADERS (variable-length header that .NET sends)
         let sql_bytes = Self::skip_all_headers(payload);
         let sql = Self::decode_utf16le(sql_bytes);
-        let sql = sql.trim().to_string();
-
+        let sql = sql.trim();
 
         if sql.is_empty() {
             let done = Self::build_done(DONE_FINAL, 0);
@@ -401,12 +1239,15 @@ impl TdsConnection {
             return Ok(());
         }
 
-        // Split on semicolons for multi-statement batches (GO-separated in T-SQL)
-        let statements = Self::split_statements(&sql);
+        // Fast path: single statement (no semicolons) — avoid split_statements allocation
+        let statements: Vec<&str> = if sql.contains(';') {
+            sql.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+        } else {
+            vec![sql]
+        };
         let mut resp = Vec::new();
 
-        for (idx, stmt_sql) in statements.iter().enumerate() {
-            let trimmed = stmt_sql.trim();
+        for (idx, &trimmed) in statements.iter().enumerate() {
             if trimmed.is_empty() {
                 continue;
             }
@@ -417,13 +1258,17 @@ impl TdsConnection {
                 continue;
             }
 
-            // Rewrite T-SQL to ForgeDB SQL
+            // Rewrite T-SQL to ForgeDB SQL (fast path skips when no T-SQL features)
             let rewritten = Self::rewrite_tsql(trimmed);
 
             // Rewrite temp table names (#table -> #tmp_connid__table)
-            let rewritten = Self::rewrite_temp_tables(&rewritten, self.conn_id);
+            let final_sql = if rewritten.contains('#') {
+                Self::rewrite_temp_tables(&rewritten, self.conn_id)
+            } else {
+                rewritten
+            };
 
-            let result = self.db.execute_sql_session(&rewritten, &mut self.current_txn_id);
+            let result = self.db.execute_sql_session(&final_sql, &mut self.current_txn_id);
 
             match result {
                 Ok(exec_result) => {
@@ -601,6 +1446,19 @@ impl TdsConnection {
     }
 
     fn rewrite_tsql(sql: &str) -> String {
+        // Fast path: simple INSERT/UPDATE/DELETE/SELECT with no T-SQL features
+        // Skip all string replacements when no rewriting is needed
+        let upper_prefix: String = sql.chars().take(12).collect::<String>().to_uppercase();
+        if (upper_prefix.starts_with("INSERT") || upper_prefix.starts_with("UPDATE")
+            || upper_prefix.starts_with("DELETE") || upper_prefix.starts_with("SELECT"))
+            && !sql.contains('[') && !sql.contains("NVARCHAR") && !sql.contains("nvarchar")
+            && !sql.contains("IDENTITY") && !sql.contains("GETDATE")
+            && !sql.contains("ISNULL(") && !sql.contains("LEN(")
+            && !sql.contains("NOLOCK") && !sql.contains(" TOP ")
+        {
+            return sql.to_string();
+        }
+
         let mut s = sql.to_string();
         let upper = s.to_uppercase();
 
@@ -858,6 +1716,24 @@ impl TdsConnection {
         buf.extend_from_slice(&size_bytes);
         buf.push(size_utf16.len() as u8);
         buf.extend_from_slice(&size_bytes);
+    }
+
+    /// ENVCHANGE type 7: SQL Collation.
+    /// SqlClient uses this to resolve MetaType for string parameters.
+    /// Without it, parameterized queries crash with NullReferenceException.
+    fn append_envchange_collation(buf: &mut Vec<u8>) {
+        // ENVCHANGE type 7: Collation
+        // Format: Type(1) + NewLen(1) + NewCollation(5) + OldLen(1) + OldCollation(5)
+        // Collation bytes: Latin1_General_CI_AS = [0x09, 0x04, 0xD0, 0x00, 0x34]
+        let collation = &DEFAULT_COLLATION;
+        let data_len = 1 + 1 + 5 + 1 + 5; // type + newlen + new + oldlen + old
+        buf.push(TOKEN_ENVCHANGE);
+        buf.extend_from_slice(&(data_len as u16).to_le_bytes());
+        buf.push(7); // Type: SQL Collation
+        buf.push(5); // NewValue length
+        buf.extend_from_slice(collation);
+        buf.push(5); // OldValue length
+        buf.extend_from_slice(collation);
     }
 
     // -----------------------------------------------------------------------

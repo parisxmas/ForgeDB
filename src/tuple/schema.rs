@@ -36,11 +36,10 @@ impl Schema {
     /// Returns the column index and a reference to the [`Column`], or `None`
     /// if no column with the given name exists.
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
-        let name_lower = name.to_lowercase();
         self.columns
             .iter()
             .enumerate()
-            .find(|(_, c)| c.name.to_lowercase() == name_lower)
+            .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Returns the number of columns in the schema.

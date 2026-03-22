@@ -481,6 +481,40 @@ pub fn deserialize_single_column(data: &[u8], schema: &Schema, target_col: usize
     Ok(Value::Null)
 }
 
+/// Read a fixed-size integer column as raw i64 from tuple bytes.
+/// Returns None if the column is null, variable-length, or out of range.
+/// Zero Value/String allocation — just reads 4 or 8 bytes from the buffer.
+#[inline]
+pub fn read_column_i64_raw(data: &[u8], schema: &Schema, col_idx: usize) -> Option<i64> {
+    let ncols = schema.column_count();
+    if col_idx >= ncols { return None; }
+    let bitmap_len = (ncols + 7) / 8;
+    if data.len() < bitmap_len { return None; }
+    // Null check
+    if data[col_idx / 8] & (1 << (col_idx % 8)) != 0 { return None; }
+    let dt = &schema.columns[col_idx].data_type;
+    if !matches!(dt, DataType::Integer | DataType::BigInt) { return None; }
+    // Skip preceding non-null fixed columns
+    let mut pos = bitmap_len;
+    for (i, col) in schema.columns.iter().enumerate() {
+        if matches!(col.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
+            continue;
+        }
+        if i == col_idx {
+            return match dt {
+                DataType::Integer if pos + 4 <= data.len() =>
+                    Some(i32::from_le_bytes(data[pos..pos+4].try_into().ok()?) as i64),
+                DataType::BigInt if pos + 8 <= data.len() =>
+                    Some(i64::from_le_bytes(data[pos..pos+8].try_into().ok()?)),
+                _ => None,
+            };
+        }
+        if data[i / 8] & (1 << (i % 8)) != 0 { continue; }
+        pos += fixed_field_size(&col.data_type);
+    }
+    None
+}
+
 #[inline]
 fn fixed_field_size(dt: &DataType) -> usize {
     match dt {

@@ -676,6 +676,20 @@ impl<'a> VectorizedOperator for VecFilter<'a> {
                 None => return Ok(None),
                 Some(mut chunk) => {
                     let schema = self.child.schema();
+
+                    // --- SIMD fast path ---
+                    // If the predicate is a simple comparison on an Int32 column
+                    // against an integer literal, use SIMD batch filtering.
+                    if let Some(selection) = try_simd_filter(&chunk, &self.predicate, schema) {
+                        let any_selected = selection.iter().any(|&s| s);
+                        if !any_selected {
+                            continue;
+                        }
+                        chunk.compact(&selection);
+                        return Ok(Some(chunk));
+                    }
+
+                    // --- Scalar fallback ---
                     // Build selection vector by evaluating predicate per row
                     let mut selection = Vec::with_capacity(chunk.len);
                     let mut any_selected = false;
@@ -700,6 +714,127 @@ impl<'a> VectorizedOperator for VecFilter<'a> {
             }
         }
     }
+}
+
+/// Attempt to use SIMD for a simple integer comparison filter.
+///
+/// Matches predicates of the form:
+///   `column_ref {>, <, >=, <=, =} integer_literal`
+///
+/// When the column is stored as Int32 in the ColumnData, this uses the
+/// SIMD-accelerated comparison functions from `super::simd`.
+///
+/// Returns `None` if the predicate shape is not supported (falls back to
+/// per-row evaluation).
+fn try_simd_filter(
+    chunk: &DataChunk,
+    predicate: &Expr,
+    schema: &Schema,
+) -> Option<Vec<bool>> {
+    use crate::sql::ast::{BinaryOperator, LiteralValue};
+
+    // Match: column <op> literal  OR  literal <op> column
+    if let Expr::BinaryOp { left, op, right } = predicate {
+        let (col_idx, threshold, effective_op) =
+            match (left.as_ref(), right.as_ref()) {
+                // column <op> literal
+                (Expr::ColumnRef { table, column }, Expr::Literal(LiteralValue::Integer(n))) => {
+                    let idx = find_column_index(schema, table.as_deref(), column)?;
+                    Some((idx, *n as i32, op.clone()))
+                }
+                // literal <op> column => flip the operator
+                (Expr::Literal(LiteralValue::Integer(n)), Expr::ColumnRef { table, column }) => {
+                    let idx = find_column_index(schema, table.as_deref(), column)?;
+                    let flipped = match op {
+                        BinaryOperator::Gt => BinaryOperator::Lt,
+                        BinaryOperator::Lt => BinaryOperator::Gt,
+                        BinaryOperator::GtEq => BinaryOperator::LtEq,
+                        BinaryOperator::LtEq => BinaryOperator::GtEq,
+                        BinaryOperator::Eq => BinaryOperator::Eq,
+                        _ => return None,
+                    };
+                    Some((idx, *n as i32, flipped))
+                }
+                _ => None,
+            }?;
+
+        // Check that the literal fits in i32
+        if let (Expr::ColumnRef { .. }, Expr::Literal(LiteralValue::Integer(n))) |
+               (Expr::Literal(LiteralValue::Integer(n)), Expr::ColumnRef { .. }) = (left.as_ref(), right.as_ref()) {
+            if *n < i32::MIN as i64 || *n > i32::MAX as i64 {
+                return None; // Value doesn't fit in i32, skip SIMD
+            }
+        }
+
+        // Check that the column data is Int32
+        if col_idx >= chunk.columns.len() {
+            return None;
+        }
+        let col = &chunk.columns[col_idx];
+        if let ColumnData::Int32(ref data) = col.data {
+            if data.len() < chunk.len {
+                return None;
+            }
+            let slice = &data[..chunk.len];
+
+            let mut selection = Vec::new();
+            match effective_op {
+                BinaryOperator::Gt => {
+                    super::simd::filter_gt_i32(slice, threshold, &mut selection);
+                }
+                BinaryOperator::Lt => {
+                    super::simd::filter_lt_i32(slice, threshold, &mut selection);
+                }
+                BinaryOperator::GtEq => {
+                    super::simd::filter_gte_i32(slice, threshold, &mut selection);
+                }
+                BinaryOperator::LtEq => {
+                    super::simd::filter_lte_i32(slice, threshold, &mut selection);
+                }
+                BinaryOperator::Eq => {
+                    super::simd::filter_eq_i32(slice, threshold, &mut selection);
+                }
+                _ => return None,
+            }
+
+            // Handle nulls: force null rows to false
+            for (i, &is_null) in col.nulls.iter().enumerate().take(chunk.len) {
+                if is_null && i < selection.len() {
+                    selection[i] = false;
+                }
+            }
+
+            return Some(selection);
+        }
+    }
+
+    None
+}
+
+/// Find the column index in a schema by name, supporting qualified and bare names.
+fn find_column_index(schema: &Schema, table: Option<&str>, column: &str) -> Option<usize> {
+    // Try qualified name first
+    if let Some(tbl) = table {
+        let qualified = format!("{}.{}", tbl, column);
+        if let Some((idx, _)) = schema.get_column(&qualified) {
+            return Some(idx);
+        }
+    }
+
+    // Try bare column name
+    if let Some((idx, _)) = schema.get_column(column) {
+        return Some(idx);
+    }
+
+    // Try suffix match
+    let suffix = format!(".{}", column.to_lowercase());
+    for (i, c) in schema.columns.iter().enumerate() {
+        if c.name.to_lowercase().ends_with(&suffix) {
+            return Some(i);
+        }
+    }
+
+    None
 }
 
 // =========================================================================
@@ -871,6 +1006,15 @@ impl<'a> VectorizedOperator for VecAggregate<'a> {
 
         let child_schema = self.child.schema().clone();
 
+        // --- SIMD fast path ---
+        // If all select columns are simple aggregates (SUM/MIN/MAX/AVG/COUNT)
+        // on typed columns, accumulate directly from columnar ColumnData using
+        // SIMD-accelerated functions. This avoids reconstructing row Vec<Value>.
+        if let Some(result) = self.try_simd_aggregate(&child_schema)? {
+            return Ok(Some(result));
+        }
+
+        // --- Scalar fallback ---
         // Consume all child chunks, collecting rows for aggregate evaluation
         let mut all_rows: Vec<(crate::common::RID, Vec<Value>)> = Vec::new();
         let dummy_rid = crate::common::RID { page_id: PageId(0), slot_id: 0 };
@@ -890,6 +1034,388 @@ impl<'a> VectorizedOperator for VecAggregate<'a> {
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Descriptor for a SIMD-accelerable aggregate column.
+enum SimdAggDesc {
+    CountStar,
+    CountCol(usize),
+    SumI32(usize),
+    SumI64(usize),
+    SumF64(usize),
+    MinI32(usize),
+    MaxI32(usize),
+    MinF64(usize),
+    MaxF64(usize),
+    AvgI32(usize),
+    AvgI64(usize),
+    AvgF64(usize),
+}
+
+impl<'a> VecAggregate<'a> {
+    /// Try to compute aggregates using SIMD directly on columnar data.
+    /// Returns `None` if the aggregate shape is not supported.
+    fn try_simd_aggregate(&mut self, child_schema: &Schema) -> Result<Option<DataChunk>> {
+        use crate::sql::ast::LiteralValue;
+
+        // Classify each select column
+        let mut descs = Vec::with_capacity(self.columns.len());
+        for col in &self.columns {
+            match col {
+                SelectColumn::Expr { expr, .. } => {
+                    match expr {
+                        Expr::Function { name, args, distinct } => {
+                            if *distinct {
+                                return Ok(None); // DISTINCT not supported in SIMD path
+                            }
+                            let upper = name.to_uppercase();
+                            match upper.as_str() {
+                                "COUNT" => {
+                                    if args.is_empty() || matches!(args.first(), Some(Expr::Literal(LiteralValue::String(s))) if s == "*") {
+                                        descs.push(SimdAggDesc::CountStar);
+                                    } else if let Some(Expr::ColumnRef { table, column }) = args.first() {
+                                        if let Some(idx) = find_column_index(child_schema, table.as_deref(), column) {
+                                            descs.push(SimdAggDesc::CountCol(idx));
+                                        } else {
+                                            return Ok(None);
+                                        }
+                                    } else {
+                                        return Ok(None);
+                                    }
+                                }
+                                "SUM" => {
+                                    if let Some(Expr::ColumnRef { table, column }) = args.first() {
+                                        if let Some(idx) = find_column_index(child_schema, table.as_deref(), column) {
+                                            let col_type = &child_schema.columns[idx].data_type;
+                                            match col_type {
+                                                DataType::Integer => descs.push(SimdAggDesc::SumI32(idx)),
+                                                DataType::BigInt => descs.push(SimdAggDesc::SumI64(idx)),
+                                                DataType::Float => descs.push(SimdAggDesc::SumF64(idx)),
+                                                _ => return Ok(None),
+                                            }
+                                        } else {
+                                            return Ok(None);
+                                        }
+                                    } else {
+                                        return Ok(None);
+                                    }
+                                }
+                                "MIN" => {
+                                    if let Some(Expr::ColumnRef { table, column }) = args.first() {
+                                        if let Some(idx) = find_column_index(child_schema, table.as_deref(), column) {
+                                            let col_type = &child_schema.columns[idx].data_type;
+                                            match col_type {
+                                                DataType::Integer => descs.push(SimdAggDesc::MinI32(idx)),
+                                                DataType::Float => descs.push(SimdAggDesc::MinF64(idx)),
+                                                _ => return Ok(None),
+                                            }
+                                        } else {
+                                            return Ok(None);
+                                        }
+                                    } else {
+                                        return Ok(None);
+                                    }
+                                }
+                                "MAX" => {
+                                    if let Some(Expr::ColumnRef { table, column }) = args.first() {
+                                        if let Some(idx) = find_column_index(child_schema, table.as_deref(), column) {
+                                            let col_type = &child_schema.columns[idx].data_type;
+                                            match col_type {
+                                                DataType::Integer => descs.push(SimdAggDesc::MaxI32(idx)),
+                                                DataType::Float => descs.push(SimdAggDesc::MaxF64(idx)),
+                                                _ => return Ok(None),
+                                            }
+                                        } else {
+                                            return Ok(None);
+                                        }
+                                    } else {
+                                        return Ok(None);
+                                    }
+                                }
+                                "AVG" => {
+                                    if let Some(Expr::ColumnRef { table, column }) = args.first() {
+                                        if let Some(idx) = find_column_index(child_schema, table.as_deref(), column) {
+                                            let col_type = &child_schema.columns[idx].data_type;
+                                            match col_type {
+                                                DataType::Integer => descs.push(SimdAggDesc::AvgI32(idx)),
+                                                DataType::BigInt => descs.push(SimdAggDesc::AvgI64(idx)),
+                                                DataType::Float => descs.push(SimdAggDesc::AvgF64(idx)),
+                                                _ => return Ok(None),
+                                            }
+                                        } else {
+                                            return Ok(None);
+                                        }
+                                    } else {
+                                        return Ok(None);
+                                    }
+                                }
+                                _ => return Ok(None),
+                            }
+                        }
+                        _ => return Ok(None), // Non-function expression
+                    }
+                }
+                SelectColumn::AllColumns(_) => return Ok(None),
+            }
+        }
+
+        // Now consume chunks and accumulate using SIMD
+        let num_cols = descs.len();
+        let mut total_count: i64 = 0;
+        let mut non_null_counts = vec![0i64; num_cols];
+        let mut sum_i64_accs = vec![0i64; num_cols];
+        let mut sum_f64_accs = vec![0.0f64; num_cols];
+        let mut min_i32_accs = vec![i32::MAX; num_cols];
+        let mut max_i32_accs = vec![i32::MIN; num_cols];
+        let mut min_f64_accs = vec![f64::INFINITY; num_cols];
+        let mut max_f64_accs = vec![f64::NEG_INFINITY; num_cols];
+        let mut has_any_value = vec![false; num_cols];
+
+        while let Some(chunk) = self.child.next_chunk()? {
+            total_count += chunk.len as i64;
+
+            for (di, desc) in descs.iter().enumerate() {
+                match desc {
+                    SimdAggDesc::CountStar => {
+                        // Handled via total_count
+                    }
+                    SimdAggDesc::CountCol(col_idx) => {
+                        let col = &chunk.columns[*col_idx];
+                        let non_null = chunk.len - col.nulls.iter().take(chunk.len).filter(|&&n| n).count();
+                        non_null_counts[di] += non_null as i64;
+                    }
+                    SimdAggDesc::SumI32(col_idx) => {
+                        if let ColumnData::Int32(ref data) = chunk.columns[*col_idx].data {
+                            // Build a non-null slice for SIMD processing
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls {
+                                sum_i64_accs[di] += super::simd::sum_i32(&data[..chunk.len]);
+                                non_null_counts[di] += chunk.len as i64;
+                            } else {
+                                // Process with null filtering (scalar)
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    sum_i64_accs[di] += data[i] as i64;
+                                    non_null_counts[di] += 1;
+                                }
+                            }
+                            has_any_value[di] = true;
+                        }
+                    }
+                    SimdAggDesc::SumI64(col_idx) => {
+                        if let ColumnData::Int64(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls {
+                                sum_i64_accs[di] += super::simd::sum_i64(&data[..chunk.len]);
+                                non_null_counts[di] += chunk.len as i64;
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    sum_i64_accs[di] += data[i];
+                                    non_null_counts[di] += 1;
+                                }
+                            }
+                            has_any_value[di] = true;
+                        }
+                    }
+                    SimdAggDesc::SumF64(col_idx) => {
+                        if let ColumnData::Float64(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls {
+                                sum_f64_accs[di] += super::simd::sum_f64(&data[..chunk.len]);
+                                non_null_counts[di] += chunk.len as i64;
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    sum_f64_accs[di] += data[i];
+                                    non_null_counts[di] += 1;
+                                }
+                            }
+                            has_any_value[di] = true;
+                        }
+                    }
+                    SimdAggDesc::MinI32(col_idx) => {
+                        if let ColumnData::Int32(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls && chunk.len > 0 {
+                                if let Some(m) = super::simd::min_i32(&data[..chunk.len]) {
+                                    if m < min_i32_accs[di] { min_i32_accs[di] = m; }
+                                    has_any_value[di] = true;
+                                }
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    if data[i] < min_i32_accs[di] { min_i32_accs[di] = data[i]; }
+                                    has_any_value[di] = true;
+                                }
+                            }
+                        }
+                    }
+                    SimdAggDesc::MaxI32(col_idx) => {
+                        if let ColumnData::Int32(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls && chunk.len > 0 {
+                                if let Some(m) = super::simd::max_i32(&data[..chunk.len]) {
+                                    if m > max_i32_accs[di] { max_i32_accs[di] = m; }
+                                    has_any_value[di] = true;
+                                }
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    if data[i] > max_i32_accs[di] { max_i32_accs[di] = data[i]; }
+                                    has_any_value[di] = true;
+                                }
+                            }
+                        }
+                    }
+                    SimdAggDesc::MinF64(col_idx) => {
+                        if let ColumnData::Float64(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls && chunk.len > 0 {
+                                if let Some(m) = super::simd::min_f64(&data[..chunk.len]) {
+                                    if m < min_f64_accs[di] { min_f64_accs[di] = m; }
+                                    has_any_value[di] = true;
+                                }
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    if data[i] < min_f64_accs[di] { min_f64_accs[di] = data[i]; }
+                                    has_any_value[di] = true;
+                                }
+                            }
+                        }
+                    }
+                    SimdAggDesc::MaxF64(col_idx) => {
+                        if let ColumnData::Float64(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls && chunk.len > 0 {
+                                if let Some(m) = super::simd::max_f64(&data[..chunk.len]) {
+                                    if m > max_f64_accs[di] { max_f64_accs[di] = m; }
+                                    has_any_value[di] = true;
+                                }
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    if data[i] > max_f64_accs[di] { max_f64_accs[di] = data[i]; }
+                                    has_any_value[di] = true;
+                                }
+                            }
+                        }
+                    }
+                    SimdAggDesc::AvgI32(col_idx) => {
+                        if let ColumnData::Int32(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls {
+                                sum_f64_accs[di] += super::simd::sum_i32(&data[..chunk.len]) as f64;
+                                non_null_counts[di] += chunk.len as i64;
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    sum_f64_accs[di] += data[i] as f64;
+                                    non_null_counts[di] += 1;
+                                }
+                            }
+                            has_any_value[di] = true;
+                        }
+                    }
+                    SimdAggDesc::AvgI64(col_idx) => {
+                        if let ColumnData::Int64(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls {
+                                sum_f64_accs[di] += super::simd::sum_i64(&data[..chunk.len]) as f64;
+                                non_null_counts[di] += chunk.len as i64;
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    sum_f64_accs[di] += data[i] as f64;
+                                    non_null_counts[di] += 1;
+                                }
+                            }
+                            has_any_value[di] = true;
+                        }
+                    }
+                    SimdAggDesc::AvgF64(col_idx) => {
+                        if let ColumnData::Float64(ref data) = chunk.columns[*col_idx].data {
+                            let nulls = &chunk.columns[*col_idx].nulls;
+                            let has_nulls = nulls.iter().take(chunk.len).any(|&n| n);
+                            if !has_nulls {
+                                sum_f64_accs[di] += super::simd::sum_f64(&data[..chunk.len]);
+                                non_null_counts[di] += chunk.len as i64;
+                            } else {
+                                for i in 0..chunk.len {
+                                    if i < nulls.len() && nulls[i] { continue; }
+                                    sum_f64_accs[di] += data[i];
+                                    non_null_counts[di] += 1;
+                                }
+                            }
+                            has_any_value[di] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Finalize results
+        let mut result_row = Vec::with_capacity(num_cols);
+        for (di, desc) in descs.iter().enumerate() {
+            let val = match desc {
+                SimdAggDesc::CountStar => Value::BigInt(total_count),
+                SimdAggDesc::CountCol(_) => Value::BigInt(non_null_counts[di]),
+                SimdAggDesc::SumI32(_) | SimdAggDesc::SumI64(_) => {
+                    if !has_any_value[di] || non_null_counts[di] == 0 {
+                        Value::Null
+                    } else {
+                        let s = sum_i64_accs[di];
+                        if s >= i32::MIN as i64 && s <= i32::MAX as i64 {
+                            Value::Integer(s as i32)
+                        } else {
+                            Value::BigInt(s)
+                        }
+                    }
+                }
+                SimdAggDesc::SumF64(_) => {
+                    if !has_any_value[di] || non_null_counts[di] == 0 {
+                        Value::Null
+                    } else {
+                        Value::Float(sum_f64_accs[di])
+                    }
+                }
+                SimdAggDesc::MinI32(_) => {
+                    if !has_any_value[di] { Value::Null } else { Value::Integer(min_i32_accs[di]) }
+                }
+                SimdAggDesc::MaxI32(_) => {
+                    if !has_any_value[di] { Value::Null } else { Value::Integer(max_i32_accs[di]) }
+                }
+                SimdAggDesc::MinF64(_) => {
+                    if !has_any_value[di] { Value::Null } else { Value::Float(min_f64_accs[di]) }
+                }
+                SimdAggDesc::MaxF64(_) => {
+                    if !has_any_value[di] { Value::Null } else { Value::Float(max_f64_accs[di]) }
+                }
+                SimdAggDesc::AvgI32(_) | SimdAggDesc::AvgI64(_) | SimdAggDesc::AvgF64(_) => {
+                    if non_null_counts[di] == 0 {
+                        Value::Null
+                    } else {
+                        Value::Float(sum_f64_accs[di] / non_null_counts[di] as f64)
+                    }
+                }
+            };
+            result_row.push(val);
+        }
+
+        let mut result_chunk = DataChunk::new(result_row.len());
+        result_chunk.push_row(&result_row);
+        Ok(Some(result_chunk))
     }
 }
 

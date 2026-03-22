@@ -12,6 +12,7 @@ name = "forgedb-server"
 path = "src/bin/forgedb-server.rs"
 
 [profile.release]
+opt-level = 3
 strip = true
 lto = true
 codegen-units = 1

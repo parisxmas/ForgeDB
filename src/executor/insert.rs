@@ -41,7 +41,7 @@ pub fn execute_insert(
     catalog: &Catalog,
     indexes: &[(String, BTreeIndex)],
     clustered_indexes: &std::collections::HashMap<String, ClusteredIndex>,
-    auto_increment_counters: &mut std::collections::HashMap<String, i64>,
+    auto_increment_counters: &std::sync::Mutex<std::collections::HashMap<String, i64>>,
     txn_ctx: &mut Option<TxnContext>,
     on_conflict: &Option<OnConflict>,
 ) -> Result<ExecuteResult> {
@@ -97,20 +97,22 @@ pub fn execute_insert(
             eval_values
         };
 
-        // Handle AUTO_INCREMENT columns (skip loop if no auto_increment columns)
+        // Handle AUTO_INCREMENT columns — lock briefly, only when needed
         if has_auto_inc {
-        for (i, col) in schema.columns.iter().enumerate() {
-            if col.auto_increment && i < final_values.len() && final_values[i].is_null() {
-                let counter_key = format!("{}.{}", table_name.to_lowercase(), col.name.to_lowercase());
-                let next_val = auto_increment_counters.entry(counter_key).or_insert(0);
-                *next_val += 1;
-                last_insert_id = *next_val as u64;
-                match col.data_type {
-                    DataType::BigInt => final_values[i] = Value::BigInt(*next_val),
-                    _ => final_values[i] = Value::Integer(*next_val as i32),
+            let mut counters = auto_increment_counters.lock().unwrap();
+            for (i, col) in schema.columns.iter().enumerate() {
+                if col.auto_increment && i < final_values.len() && final_values[i].is_null() {
+                    let counter_key = format!("{}.{}", table_name.to_lowercase(), col.name.to_lowercase());
+                    let next_val = counters.entry(counter_key).or_insert(0);
+                    *next_val += 1;
+                    last_insert_id = *next_val as u64;
+                    match col.data_type {
+                        DataType::BigInt => final_values[i] = Value::BigInt(*next_val),
+                        _ => final_values[i] = Value::Integer(*next_val as i32),
+                    }
                 }
             }
-        }
+            drop(counters); // release immediately after incrementing
         }
 
         // Handle DEFAULT values for NULL columns (skip if no defaults)
