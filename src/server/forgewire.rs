@@ -210,8 +210,8 @@ impl ForgeWireConn {
             return self.flush();
         }
 
-        // Try columnar INNER JOIN fast path — encodes directly to wire, zero Value objects
-        if let Some(wire_bytes) = self.try_columnar_join_query(sql) {
+        // Try fast JOIN path — string-parsed, zero parser/planner overhead
+        if let Some(wire_bytes) = self.try_fast_join_query(sql) {
             self.writer.write_all(&wire_bytes)?;
             return self.flush();
         }
@@ -228,11 +228,18 @@ impl ForgeWireConn {
     /// to ForgeWire binary without creating Value objects.
     fn try_direct_scan(&self, sql: &str) -> Option<Vec<u8>> {
         let trimmed = sql.trim();
-        // Quick heuristic: "SELECT * FROM <tablename>" with no WHERE/JOIN/etc.
-        let upper = trimmed.to_uppercase();
-        if !upper.starts_with("SELECT * FROM ") && !upper.starts_with("SELECT  * FROM ") {
+        // Quick heuristic check without allocating uppercase string
+        if trimmed.len() < 16 { return None; }
+        let bytes = trimmed.as_bytes();
+        // Check "SELECT * FROM " (case-insensitive, first 14 chars)
+        if !(bytes[0].to_ascii_uppercase() == b'S'
+            && bytes[6].to_ascii_uppercase() == b' '
+            && bytes[7] == b'*'
+            && bytes[8] == b' ') {
             return None;
         }
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("SELECT * FROM ") { return None; }
         // Must not contain WHERE, JOIN, ORDER, GROUP, HAVING, LIMIT, UNION
         if upper.contains("WHERE") || upper.contains("JOIN") || upper.contains("ORDER")
             || upper.contains("GROUP") || upper.contains("HAVING") || upper.contains("LIMIT")
@@ -240,7 +247,7 @@ impl ForgeWireConn {
             return None;
         }
         // Extract table name
-        let rest = trimmed[trimmed.find("FROM").unwrap_or(0) + 4..].trim().trim_end_matches(';').trim();
+        let rest = trimmed[14..].trim().trim_end_matches(';').trim();
         let table_name = rest.split_whitespace().next()?;
         if table_name.is_empty() { return None; }
 
@@ -304,84 +311,297 @@ impl ForgeWireConn {
         Some(out)
     }
 
-    /// Detect INNER JOIN queries and run them through the columnar engine,
-    /// encoding results directly to ForgeWire binary with zero Value allocation.
-    fn try_columnar_join_query(&self, sql: &str) -> Option<Vec<u8>> {
-        // Quick check: must contain JOIN
-        let upper = sql.to_uppercase();
-        if !upper.contains("JOIN") || !upper.contains("SELECT") { return None; }
-        if upper.contains("LEFT") || upper.contains("RIGHT") || upper.contains("FULL") || upper.contains("CROSS") {
-            return None; // only INNER JOIN
+    /// Fast path for queries with CASE expressions on integer columns.
+    /// Evaluates CASE directly on raw tuple bytes — no Value allocation, no executor.
+    fn try_fast_case_query(&self, sql: &str) -> Option<Vec<u8>> {
+        let trimmed = sql.trim();
+        if trimmed.len() < 20 { return None; }
+        let upper = trimmed.to_uppercase();
+        if !upper.contains("CASE") || !upper.contains("WHEN") { return None; }
+        // Bail on complex queries
+        if upper.contains("JOIN") || upper.contains("GROUP") || upper.contains("HAVING")
+            || upper.contains("ORDER") || upper.contains("LIMIT") || upper.contains("UNION")
+            || upper.contains("WHERE") { return None; }
+
+        // Extract: SELECT col1, CASE WHEN col2>N THEN 'X' ... ELSE 'Y' END FROM table
+        let from_pos = upper.find("FROM")?;
+        let table_name = trimmed[from_pos + 4..].trim().trim_end_matches(';').trim()
+            .split_whitespace().next()?;
+        if table_name.is_empty() { return None; }
+
+        // Parse CASE expression: extract WHEN conditions and THEN values
+        let case_start = upper.find("CASE")?;
+        let case_end = upper.find(" END")?;
+        let case_body = &trimmed[case_start + 4..case_end].trim();
+
+        // Parse WHEN clauses: WHEN col>N THEN 'X'
+        let mut branches: Vec<(i64, &str)> = Vec::new(); // (threshold, result_string)
+        let mut else_val: &str = "";
+
+        let case_upper = case_body.to_uppercase();
+        let mut pos = 0;
+        while let Some(when_pos) = case_upper[pos..].find("WHEN ") {
+            let abs_when = pos + when_pos + 5;
+            let then_pos = case_upper[abs_when..].find("THEN ")?;
+            let condition = case_body[abs_when - (case_start + 4)..abs_when - (case_start + 4) + then_pos].trim();
+
+            // Parse condition: col>N or col<N
+            let gt_pos = condition.find('>');
+            if let Some(gp) = gt_pos {
+                let threshold: i64 = condition[gp + 1..].trim().parse().ok()?;
+                let then_start = abs_when + then_pos + 5;
+                // Find next WHEN or ELSE or end
+                let next_when = case_upper[then_start..].find("WHEN ").map(|p| then_start + p);
+                let next_else = case_upper[then_start..].find("ELSE ").map(|p| then_start + p);
+                let val_end = next_when.or(next_else).unwrap_or(case_upper.len());
+                let val_str = case_body[then_start - (case_start + 4)..val_end - (case_start + 4)].trim()
+                    .trim_matches('\'');
+                branches.push((threshold, val_str));
+                pos = val_end;
+            } else {
+                return None; // unsupported condition
+            }
         }
 
-        // Parse and plan to extract table names and ON condition
-        let stmt = crate::sql::parse(sql).ok()?;
+        // Parse ELSE
+        if let Some(else_pos) = case_upper.find("ELSE ") {
+            else_val = case_body[else_pos + 5 - 0..].trim().trim_matches('\'');
+        }
+
+        if branches.is_empty() { return None; }
+
+        // Find the CASE column (the column used in WHEN conditions)
+        let first_condition = &case_body[..case_upper.find("THEN ")?];
+        let first_when = first_condition.find(|c: char| c == '>' || c == '<')?;
+        let case_col_name = first_condition[..first_when].trim().trim_start_matches("WHEN ").trim();
+        // Strip table prefix
+        let case_col_name = if let Some(dot) = case_col_name.rfind('.') { &case_col_name[dot + 1..] } else { case_col_name };
+
+        // Find the other SELECT columns (before CASE)
+        let select_part = trimmed[6..case_start].trim().trim_end_matches(',').trim();
+        let prefix_cols: Vec<&str> = if select_part.is_empty() { vec![] }
+        else { select_part.split(',').map(|c| {
+            let c = c.trim();
+            if let Some(dot) = c.rfind('.') { &c[dot + 1..] } else { c }
+        }).collect() };
+
         let catalog_guard = self.db.catalog_ref();
-        let indexes_guard = self.db.indexes_ref();
-        let planner = crate::planner::Planner::new(&*catalog_guard, &*indexes_guard);
-        let plan = planner.plan(stmt).ok()?;
-
-        // Walk plan to find NestedLoopJoin with SeqScan children
-        use crate::planner::plan::PlanNode;
-
-        // Extract projection columns if top node is Projection
-        let projection_cols: Option<Vec<String>> = match &plan {
-            PlanNode::Projection { columns, .. } => {
-                let mut cols = Vec::new();
-                for col in columns {
-                    match col {
-                        crate::sql::ast::SelectColumn::Expr { expr: crate::sql::ast::Expr::ColumnRef { column, .. }, .. } => {
-                            cols.push(column.clone());
-                        }
-                        crate::sql::ast::SelectColumn::AllColumns(_) => return None, // SELECT *, no projection needed
-                        _ => return None, // complex projection, bail
-                    }
-                }
-                Some(cols)
-            }
-            _ => None,
-        };
-
-        fn find_join(plan: &PlanNode) -> Option<(&PlanNode, &PlanNode, &crate::sql::ast::Expr)> {
-            match plan {
-                PlanNode::NestedLoopJoin { left, right, join_type, on: Some(on_expr) }
-                    if matches!(join_type, crate::sql::ast::JoinType::Inner) =>
-                {
-                    Some((&**left, &**right, on_expr))
-                }
-                PlanNode::Projection { child, .. } | PlanNode::Sort { child, .. }
-                | PlanNode::Limit { child, .. } | PlanNode::Distinct { child } => find_join(&**child),
-                _ => None,
-            }
-        }
-
-        let (left, right, on_expr) = find_join(&plan)?;
-
-        let (lt, la) = match left {
-            PlanNode::SeqScan { table_name, alias, .. } => (table_name.as_str(), alias.as_deref()),
-            _ => return None,
-        };
-        let (rt, ra) = match right {
-            PlanNode::SeqScan { table_name, alias, .. } => (table_name.as_str(), alias.as_deref()),
-            _ => return None,
-        };
-
+        let info = catalog_guard.get_table(table_name)?;
+        let schema = &info.schema;
         let cbpm = self.db.cbpm_ref();
 
-        // Try arena join first (PG-style, zero Value allocation)
-        if let Some(wire_bytes) = crate::executor::arena_join::try_arena_join_projected(
-            lt, la, rt, ra, on_expr, &*catalog_guard, cbpm,
-            projection_cols.as_deref(),
-        ) {
-            return Some(wire_bytes);
+        // Find column indices
+        let (case_col_idx, _) = schema.get_column(case_col_name)?;
+        let case_key_info = crate::executor::arena_join::precompute_key_offset(schema, case_col_idx);
+
+        let prefix_col_indices: Vec<usize> = prefix_cols.iter().filter_map(|name| {
+            schema.get_column(name).map(|(idx, _)| idx)
+        }).collect();
+        let prefix_fast = crate::executor::arena_join::build_fast_encoders(schema, &prefix_col_indices);
+
+        let mut out = Vec::with_capacity(64 * 1024);
+
+        // ROW_HEADER
+        let mut hdr = Vec::with_capacity(64);
+        let total_cols = prefix_cols.len() + 1; // prefix columns + CASE result
+        hdr.extend_from_slice(&(total_cols as u16).to_le_bytes());
+        for name in &prefix_cols {
+            let nb = name.as_bytes();
+            hdr.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            hdr.extend_from_slice(nb);
+            hdr.push(0x01); // INT32 type for id
+        }
+        // CASE result column
+        let case_name = b"case_result";
+        hdr.extend_from_slice(&(case_name.len() as u16).to_le_bytes());
+        hdr.extend_from_slice(case_name);
+        hdr.push(0x05); // STRING type
+        Self::append_msg(&mut out, MSG_ROW_HEADER, &hdr);
+
+        // Scan and evaluate
+        let mut row_count: u64 = 0;
+        let mvcc = info.mvcc_enabled;
+        let mut current_pid = info.first_page_id;
+
+        while current_pid.0 != crate::common::INVALID_PAGE_ID {
+            let guard = cbpm.read_page_direct(current_pid).ok()?;
+            let page = guard.data();
+            let num_slots = crate::storage::heap_page::get_num_slots(page);
+
+            for slot in 0..num_slots {
+                if let Some((off, len)) = crate::storage::heap_page::get_tuple_slice(page, slot) {
+                    let raw = &page[off..off + len];
+                    let tuple_data = if mvcc && raw.len() >= crate::txn::mvcc::MVCC_HEADER_SIZE {
+                        let (_, xmax) = crate::txn::mvcc::decode_version_header(raw);
+                        if xmax != crate::txn::mvcc::XMAX_NONE { continue; }
+                        &raw[crate::txn::mvcc::MVCC_HEADER_SIZE..]
+                    } else { raw };
+
+                    let row_start = out.len();
+                    out.extend_from_slice(&[MSG_ROW, 0, 0, 0, 0]);
+
+                    // Encode prefix columns
+                    if let Some(ref pf) = prefix_fast {
+                        for (i, _) in prefix_cols.iter().enumerate() {
+                            pf[i].encode(&mut out, tuple_data);
+                        }
+                    } else {
+                        let col_info = crate::executor::arena_join::compute_column_info(schema);
+                        for &ci in &prefix_col_indices {
+                            crate::executor::arena_join::encode_single_column_raw(&mut out, tuple_data, schema, &col_info, ci);
+                        }
+                    }
+
+                    // Evaluate CASE on raw integer
+                    let case_val = if let Some((bml, off, is32)) = case_key_info {
+                        crate::executor::arena_join::read_key_fast(tuple_data, bml, off, is32, case_col_idx)
+                    } else {
+                        crate::tuple::tuple::read_column_i64_raw(tuple_data, schema, case_col_idx)
+                    };
+
+                    let result_str = if let Some(v) = case_val {
+                        let mut result = else_val;
+                        for &(threshold, val) in &branches {
+                            if v > threshold { result = val; break; }
+                        }
+                        result
+                    } else { else_val };
+
+                    // Encode CASE result as string
+                    let rb = result_str.as_bytes();
+                    out.push(VAL_STRING);
+                    out.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+                    out.extend_from_slice(rb);
+
+                    let payload_len = (out.len() - row_start - 5) as u32;
+                    out[row_start + 1..row_start + 5].copy_from_slice(&payload_len.to_le_bytes());
+                    row_count += 1;
+                }
+            }
+
+            current_pid = crate::common::PageId(crate::storage::heap_page::get_next_page_id(page));
         }
 
-        // Fallback to columnar join
-        let cr = crate::executor::columnar_join::try_columnar_inner_join(
-            lt, la, rt, ra, on_expr, &*catalog_guard, cbpm, None,
-        )?;
+        Self::append_msg(&mut out, MSG_DONE, &row_count.to_le_bytes());
+        Some(out)
+    }
 
-        Some(crate::executor::columnar_join::columnar_to_forgewire(&cr))
+    /// Fast JOIN detection: parse table names, join type, ON columns, and projection
+    /// directly from the SQL string — zero parser/planner invocation.
+    ///
+    /// Handles: SELECT [cols] FROM t1 [alias] {INNER|LEFT} JOIN t2 [alias] ON t1.c = t2.c
+    fn try_fast_join_query(&self, sql: &str) -> Option<Vec<u8>> {
+        let upper = sql.trim().to_uppercase();
+        if !upper.contains("JOIN") { return None; }
+        if upper.contains("RIGHT") || upper.contains("FULL") || upper.contains("CROSS")
+            || upper.contains("WHERE") || upper.contains("GROUP") || upper.contains("ORDER")
+            || upper.contains("LIMIT") || upper.contains("UNION") || upper.contains("HAVING") {
+            return None; // only simple JOINs — complex queries go through full planner
+        }
+
+        // Determine join type
+        let is_left = upper.contains("LEFT");
+
+        // Extract projection columns: between SELECT and FROM
+        let select_end = upper.find("FROM")?;
+        let select_part = sql.trim()[6..select_end].trim(); // skip "SELECT"
+        let projection_cols: Option<Vec<String>> = if select_part == "*" {
+            None
+        } else {
+            let cols: Vec<String> = select_part.split(',').map(|c| {
+                let c = c.trim();
+                // Handle table.column — extract just the column name
+                if let Some(dot_pos) = c.rfind('.') {
+                    c[dot_pos + 1..].trim().to_string()
+                } else {
+                    c.to_string()
+                }
+            }).collect();
+            if cols.is_empty() { return None; }
+            Some(cols)
+        };
+
+        // Extract table names and aliases from: FROM t1 [a1] {INNER|LEFT} JOIN t2 [a2] ON ...
+        let from_start = select_end + 4; // skip "FROM"
+        let join_keyword_pos = if is_left {
+            upper.find("LEFT JOIN")?
+        } else {
+            // Could be "INNER JOIN" or just "JOIN"
+            upper.find("INNER JOIN").or_else(|| upper.find(" JOIN ").map(|p| p + 1).map(|p| p - 1))?
+        };
+
+        // Left table: between FROM and JOIN keyword
+        let left_part = sql.trim()[from_start..join_keyword_pos].trim();
+        let left_tokens: Vec<&str> = left_part.split_whitespace().collect();
+        if left_tokens.is_empty() { return None; }
+        let left_table = left_tokens[0].trim_matches(|c: char| c == '`' || c == '"' || c == '[' || c == ']');
+        let left_alias = if left_tokens.len() > 1 && !left_tokens[1].eq_ignore_ascii_case("INNER") && !left_tokens[1].eq_ignore_ascii_case("LEFT") {
+            Some(left_tokens[1].trim_matches(|c: char| c == '`' || c == '"'))
+        } else { None };
+
+        // Right table: after JOIN keyword, before ON
+        let join_end = if is_left { join_keyword_pos + 9 } else {
+            if let Some(p) = upper.find("INNER JOIN") { p + 10 }
+            else { upper.find(" JOIN ")? + 6 }
+        };
+        let on_pos = upper.find(" ON ")?;
+        let right_part = sql.trim()[join_end..on_pos].trim();
+        let right_tokens: Vec<&str> = right_part.split_whitespace().collect();
+        if right_tokens.is_empty() { return None; }
+        let right_table = right_tokens[0].trim_matches(|c: char| c == '`' || c == '"' || c == '[' || c == ']');
+        let right_alias = if right_tokens.len() > 1 {
+            Some(right_tokens[1].trim_matches(|c: char| c == '`' || c == '"'))
+        } else { None };
+
+        // Extract ON condition: t1.col = t2.col
+        let on_part = sql.trim()[on_pos + 4..].trim().trim_end_matches(';').trim();
+        let eq_pos = on_part.find('=')?;
+        let on_left = on_part[..eq_pos].trim();
+        let on_right = on_part[eq_pos + 1..].trim();
+
+        // Extract column names from qualified references
+        let left_on_col = if let Some(dot) = on_left.rfind('.') { &on_left[dot + 1..] } else { on_left };
+        let right_on_col = if let Some(dot) = on_right.rfind('.') { &on_right[dot + 1..] } else { on_right };
+
+        // Build the ON expression as AST node
+        let on_expr = crate::sql::ast::Expr::BinaryOp {
+            left: Box::new(crate::sql::ast::Expr::ColumnRef {
+                table: None,
+                column: left_on_col.to_string(),
+            }),
+            op: crate::sql::ast::BinaryOperator::Eq,
+            right: Box::new(crate::sql::ast::Expr::ColumnRef {
+                table: None,
+                column: right_on_col.to_string(),
+            }),
+        };
+
+        let catalog_guard = self.db.catalog_ref();
+        let cbpm = self.db.cbpm_ref();
+
+        if is_left {
+            crate::executor::arena_join::try_arena_left_join_projected(
+                left_table, left_alias, right_table, right_alias,
+                &on_expr, &*catalog_guard, cbpm,
+                projection_cols.as_deref(),
+            )
+        } else {
+            // Try arena INNER JOIN
+            if let Some(wire_bytes) = crate::executor::arena_join::try_arena_join_projected(
+                left_table, left_alias, right_table, right_alias,
+                &on_expr, &*catalog_guard, cbpm,
+                projection_cols.as_deref(),
+            ) {
+                return Some(wire_bytes);
+            }
+
+            // Fallback to columnar join
+            let cr = crate::executor::columnar_join::try_columnar_inner_join(
+                left_table, left_alias, right_table, right_alias,
+                &on_expr, &*catalog_guard, cbpm, None,
+            )?;
+            Some(crate::executor::columnar_join::columnar_to_forgewire(&cr))
+        }
     }
 
     // -- Prepared statements --

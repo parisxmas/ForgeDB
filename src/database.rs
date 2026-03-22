@@ -1277,8 +1277,53 @@ impl Database {
 
     /// Resolve subqueries in a statement by executing them and inlining results.
     /// Also resolves CTEs by converting them into derived tables.
+    fn has_subqueries_in_expr(expr: &Option<Expr>) -> bool {
+        match expr {
+            None => false,
+            Some(e) => Self::expr_has_subquery(e),
+        }
+    }
+
+    fn expr_has_subquery(expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+            Expr::BinaryOp { left, right, .. } => Self::expr_has_subquery(left) || Self::expr_has_subquery(right),
+            Expr::UnaryOp { expr, .. } => Self::expr_has_subquery(expr),
+            Expr::IsNull(e) | Expr::IsNotNull(e) => Self::expr_has_subquery(e),
+            Expr::Between { expr, low, high, .. } => Self::expr_has_subquery(expr) || Self::expr_has_subquery(low) || Self::expr_has_subquery(high),
+            Expr::Case { operand, when_clauses, else_result } => {
+                operand.as_ref().map_or(false, |e| Self::expr_has_subquery(e))
+                    || when_clauses.iter().any(|(w, t)| Self::expr_has_subquery(w) || Self::expr_has_subquery(t))
+                    || else_result.as_ref().map_or(false, |e| Self::expr_has_subquery(e))
+            }
+            Expr::In { expr, list, .. } => Self::expr_has_subquery(expr) || list.iter().any(|e| Self::expr_has_subquery(e)),
+            Expr::NotIn { expr, list, .. } => Self::expr_has_subquery(expr) || list.iter().any(|e| Self::expr_has_subquery(e)),
+            _ => false,
+        }
+    }
+
+    fn has_derived_table(from: &crate::sql::ast::FromClause) -> bool {
+        matches!(from, crate::sql::ast::FromClause::Subquery { .. })
+            || matches!(from, crate::sql::ast::FromClause::Join { left, right, .. }
+                if Self::has_derived_table(left) || Self::has_derived_table(right))
+    }
+
+    fn has_subqueries_in_columns(cols: &[crate::sql::ast::SelectColumn]) -> bool {
+        cols.iter().any(|c| match c {
+            crate::sql::ast::SelectColumn::Expr { expr, .. } => Self::expr_has_subquery(expr),
+            _ => false,
+        })
+    }
+
     fn resolve_subqueries(&self, stmt: Statement) -> Result<Statement> {
         match stmt {
+            Statement::Select { ref r#where, ref having, ref from, ref columns, ref ctes, .. } if
+                ctes.is_empty() && !Self::has_subqueries_in_expr(r#where) && !Self::has_subqueries_in_expr(having)
+                && !Self::has_derived_table(from) && !Self::has_subqueries_in_columns(columns) =>
+            {
+                // Fast path: no CTEs, no subqueries, no derived tables — return as-is
+                return Ok(stmt);
+            }
             Statement::Select { distinct, columns, from, r#where, group_by, having, order_by, limit, offset, ctes } => {
                 // Resolve recursive CTEs first
                 let mut cte_map: HashMap<String, Statement> = HashMap::new();

@@ -650,28 +650,38 @@ pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResu
             })
         }
 
-        // INNER JOIN at top level — try arena join first, then columnar
+        // JOIN at top level — try arena join fast paths
         PlanNode::NestedLoopJoin { ref left, ref right, ref join_type, ref on } => {
-            if matches!(join_type, crate::sql::ast::JoinType::Inner) {
+            if matches!(join_type, crate::sql::ast::JoinType::Inner | crate::sql::ast::JoinType::Left) {
                 if let (PlanNode::SeqScan { table_name: lt, alias: la, .. },
                         PlanNode::SeqScan { table_name: rt, alias: ra, .. }) = (left.as_ref(), right.as_ref()) {
                     if let Some(on_expr) = on {
                         if !ctx.clustered_indexes.contains_key(&lt.to_lowercase())
                             && !ctx.clustered_indexes.contains_key(&rt.to_lowercase()) {
                             let cbpm = ctx.bpm.get_cbpm();
-                            // Try arena join (PG-style, zero Value on hot path)
-                            if let Some(result) = super::arena_join::try_arena_join_result(
-                                lt, la.as_deref(), rt, ra.as_deref(),
-                                on_expr, ctx.catalog, cbpm,
-                            ) {
-                                return Ok(result);
-                            }
-                            // Fallback to columnar join
-                            if let Some(cr) = super::columnar_join::try_columnar_inner_join(
-                                lt, la.as_deref(), rt, ra.as_deref(),
-                                on_expr, ctx.catalog, cbpm, ctx.txn_ctx.as_ref(),
-                            ) {
-                                return Ok(super::columnar_join::columnar_to_execute_result(cr));
+                            if matches!(join_type, crate::sql::ast::JoinType::Left) {
+                                // LEFT JOIN arena fast path
+                                if let Some(result) = super::arena_join::try_arena_left_join_result(
+                                    lt, la.as_deref(), rt, ra.as_deref(),
+                                    on_expr, ctx.catalog, cbpm,
+                                ) {
+                                    return Ok(result);
+                                }
+                            } else {
+                                // INNER JOIN arena fast path
+                                if let Some(result) = super::arena_join::try_arena_join_result(
+                                    lt, la.as_deref(), rt, ra.as_deref(),
+                                    on_expr, ctx.catalog, cbpm,
+                                ) {
+                                    return Ok(result);
+                                }
+                                // Fallback to columnar join
+                                if let Some(cr) = super::columnar_join::try_columnar_inner_join(
+                                    lt, la.as_deref(), rt, ra.as_deref(),
+                                    on_expr, ctx.catalog, cbpm, ctx.txn_ctx.as_ref(),
+                                ) {
+                                    return Ok(super::columnar_join::columnar_to_execute_result(cr));
+                                }
                             }
                         }
                     }
