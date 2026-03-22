@@ -1,14 +1,21 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::common::{PageId, PAGE_SIZE};
 use crate::error::Result;
 
 /// Manages reading and writing pages to a database file on disk.
+///
+/// Thread-safety: all I/O uses pread/pwrite semantics (seek+read/write as
+/// atomic unit). The `next_page_id` counter is atomic. The `file` field
+/// still requires external Mutex (provided by ConcurrentBufferPool) because
+/// Rust's `File` doesn't implement Sync, but each operation is positional
+/// so interleaving is safe.
 pub struct DiskManager {
     file: File,
-    next_page_id: u32,
+    next_page_id: AtomicU32,
 }
 
 impl DiskManager {
@@ -27,11 +34,12 @@ impl DiskManager {
 
         Ok(Self {
             file,
-            next_page_id,
+            next_page_id: AtomicU32::new(next_page_id),
         })
     }
 
     /// Read page data from disk into the provided buffer.
+    /// Uses seek+read as a single operation (caller must hold external lock).
     pub fn read_page(&mut self, page_id: PageId, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
         let offset = page_id.0 as u64 * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
@@ -45,6 +53,7 @@ impl DiskManager {
     }
 
     /// Write page data from the buffer to disk.
+    /// Uses seek+write as a single operation (caller must hold external lock).
     pub fn write_page(&mut self, page_id: PageId, buf: &[u8; PAGE_SIZE]) -> Result<()> {
         let offset = page_id.0 as u64 * PAGE_SIZE as u64;
         self.file.seek(SeekFrom::Start(offset))?;
@@ -53,10 +62,9 @@ impl DiskManager {
         Ok(())
     }
 
-    /// Allocate a new page id and extend the file to accommodate it.
+    /// Allocate a new page id atomically and extend the file.
     pub fn allocate_page(&mut self) -> Result<PageId> {
-        let page_id = PageId(self.next_page_id);
-        self.next_page_id += 1;
+        let page_id = PageId(self.next_page_id.fetch_add(1, Ordering::SeqCst));
 
         // Extend the file by writing a zeroed page.
         let buf = [0u8; PAGE_SIZE];
@@ -123,7 +131,7 @@ mod tests {
         {
             let mut dm = DiskManager::new(&path).unwrap();
             // The next page id should reflect the existing file.
-            assert_eq!(dm.next_page_id, 1);
+            assert_eq!(dm.next_page_id.load(Ordering::SeqCst), 1);
 
             let mut buf = [0u8; PAGE_SIZE];
             dm.read_page(PageId(0), &mut buf).unwrap();

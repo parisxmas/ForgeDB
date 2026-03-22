@@ -7,6 +7,7 @@
 //! Page layout is similar to btree_page but leaf entries carry row payloads.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::common::{PageId, INVALID_PAGE_ID, PAGE_SIZE};
 use crate::error::{ForgeError, Result};
@@ -266,13 +267,33 @@ fn internal_search_child(page: &[u8; PAGE_SIZE], key: &[u8]) -> u32 {
 
 /// A clustered B+ tree index that stores full row data in leaf nodes.
 /// Eliminates the heap-file indirection for primary key lookups.
-#[derive(Clone)]
 pub struct ClusteredIndex {
-    pub root_page_id: PageId,
+    root_page_id_atomic: AtomicU32,
     pub key_column_index: usize,
 }
 
+impl Clone for ClusteredIndex {
+    fn clone(&self) -> Self {
+        Self {
+            root_page_id_atomic: AtomicU32::new(self.root_page_id_atomic.load(Ordering::Relaxed)),
+            key_column_index: self.key_column_index,
+        }
+    }
+}
+
 impl ClusteredIndex {
+    /// Get the current root page ID.
+    #[inline]
+    pub fn root_page_id(&self) -> PageId {
+        PageId(self.root_page_id_atomic.load(Ordering::Relaxed))
+    }
+
+    /// Set the root page ID atomically.
+    #[inline]
+    fn set_root_page_id(&self, pid: PageId) {
+        self.root_page_id_atomic.store(pid.0, Ordering::Relaxed);
+    }
+
     /// Create a new empty clustered index.
     pub fn create(bpm: &mut LocalBpm, key_column_index: usize) -> Result<Self> {
         let page_id = bpm.new_page()?;
@@ -282,7 +303,7 @@ impl ClusteredIndex {
         }
         bpm.unpin_page(page_id, true)?;
         Ok(Self {
-            root_page_id: page_id,
+            root_page_id_atomic: AtomicU32::new(page_id.0),
             key_column_index,
         })
     }
@@ -301,7 +322,7 @@ impl ClusteredIndex {
 
     /// Insert a row with its key.
     pub fn insert(
-        &mut self,
+        &self,
         bpm: &mut LocalBpm,
         key: &Value,
         row_data: &[u8],
@@ -369,7 +390,7 @@ impl ClusteredIndex {
     }
 
     /// Delete by key. Returns the old row data if found.
-    pub fn delete(&mut self, bpm: &mut LocalBpm, key: &Value) -> Result<Option<Vec<u8>>> {
+    pub fn delete(&self, bpm: &mut LocalBpm, key: &Value) -> Result<Option<Vec<u8>>> {
         let key_bytes = key.to_sort_key_bytes();
         let leaf_id = self.find_leaf(bpm, &key_bytes)?;
 
@@ -465,7 +486,7 @@ impl ClusteredIndex {
     // -----------------------------------------------------------------------
 
     fn find_leaf(&self, bpm: &mut LocalBpm, key: &[u8]) -> Result<PageId> {
-        let mut current = self.root_page_id;
+        let mut current = self.root_page_id();
         loop {
             bpm.fetch_page(current)?;
             let page_type = bpm.get_page(current).data[0];
@@ -483,7 +504,7 @@ impl ClusteredIndex {
     }
 
     fn find_leftmost_leaf(&self, bpm: &mut LocalBpm) -> Result<PageId> {
-        let mut current = self.root_page_id;
+        let mut current = self.root_page_id();
         loop {
             bpm.fetch_page(current)?;
             let page_type = bpm.get_page(current).data[0];
@@ -540,13 +561,13 @@ impl ClusteredIndex {
     }
 
     fn insert_into_parent(
-        &mut self,
+        &self,
         bpm: &mut LocalBpm,
         left_id: PageId,
         key: &[u8],
         right_id: PageId,
     ) -> Result<()> {
-        if left_id == self.root_page_id {
+        if left_id == self.root_page_id() {
             let new_root = bpm.new_page()?;
             {
                 let page = bpm.get_page_mut(new_root);
@@ -555,11 +576,11 @@ impl ClusteredIndex {
                 internal_insert(&mut page.data, key, right_id.0);
             }
             bpm.unpin_page(new_root, true)?;
-            self.root_page_id = new_root;
+            self.set_root_page_id(new_root);
             return Ok(());
         }
 
-        let parent_id = self.find_parent(bpm, self.root_page_id, left_id)?;
+        let parent_id = self.find_parent(bpm, self.root_page_id(), left_id)?;
         bpm.fetch_page(parent_id)?;
 
         let has_room = {

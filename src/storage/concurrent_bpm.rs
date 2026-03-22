@@ -96,9 +96,30 @@ impl ConcurrentBufferPool {
 
     /// Fetch a page and return its frame index. Pins the page.
     pub fn fetch_page(&self, page_id: PageId) -> Result<usize> {
+        // Fast path: check if page is already in pool
+        {
+            let mut meta = self.meta.lock().unwrap();
+            if let Some(&frame_idx) = meta.page_table.get(&page_id) {
+                let mut frame = self.frames[frame_idx].write().unwrap();
+                frame.pin_count += 1;
+                meta.lru.retain(|&idx| idx != frame_idx);
+                return Ok(frame_idx);
+            }
+        }
+        // meta lock released here — other threads can proceed while we do disk I/O
+
+        // Slow path: need to bring page from disk
+        // First, read from disk WITHOUT holding meta lock
+        let mut data = [0u8; PAGE_SIZE];
+        {
+            let mut disk = self.disk.lock().unwrap();
+            disk.read_page(page_id, &mut data)?;
+        }
+
+        // Re-acquire meta lock to find a free frame
         let mut meta = self.meta.lock().unwrap();
 
-        // Already in pool? Just pin it.
+        // Double-check: another thread may have loaded this page while we were reading
         if let Some(&frame_idx) = meta.page_table.get(&page_id) {
             let mut frame = self.frames[frame_idx].write().unwrap();
             frame.pin_count += 1;
@@ -106,15 +127,7 @@ impl ConcurrentBufferPool {
             return Ok(frame_idx);
         }
 
-        // Need a free frame
         let frame_idx = self.find_free_frame_locked(&mut meta)?;
-
-        // Read from disk (holds disk lock briefly)
-        let mut data = [0u8; PAGE_SIZE];
-        {
-            let mut disk = self.disk.lock().unwrap();
-            disk.read_page(page_id, &mut data)?;
-        }
 
         // Initialize the frame
         {

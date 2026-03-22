@@ -4,13 +4,27 @@ use crate::tuple::schema::Schema;
 use crate::tuple::types::Value;
 
 use super::eval::evaluate;
+use super::external_sort;
 
 /// Sort rows in-place by order_by expressions.
+/// For large data sets (> SORT_MEMORY_LIMIT), delegates to external merge sort.
 pub fn execute_sort(
     order_by: &[OrderByItem],
     rows: &mut [Vec<Value>],
     schema: &Schema,
 ) -> Result<()> {
+    // Check if we need external sort
+    if rows.len() > external_sort::SORT_MEMORY_LIMIT {
+        // Move rows out of the slice into a Vec, leaving empty shells behind.
+        // This avoids a full clone — the data moves, not copies.
+        let mut owned: Vec<Vec<Value>> = rows.iter_mut().map(|r| std::mem::take(r)).collect();
+        external_sort::external_sort(order_by, &mut owned, schema)?;
+        // Move sorted rows back
+        for (i, row) in owned.into_iter().enumerate() {
+            rows[i] = row;
+        }
+        return Ok(());
+    }
     // Pre-compute sort keys for each row
     let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for row in rows.iter() {

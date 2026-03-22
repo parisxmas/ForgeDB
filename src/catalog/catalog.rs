@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::common::*;
 use crate::error::{ForgeError, Result};
+use crate::planner::statistics::{ColumnStatistics, TableStatistics};
 use crate::tuple::schema::{Column, Schema};
 use crate::tuple::types::DataType;
 
@@ -15,6 +16,21 @@ pub struct TableInfo {
     pub name: String,
     pub schema: Schema,
     pub first_page_id: PageId,
+    /// Whether MVCC version headers are used for this table.
+    /// Legacy tables (created before MVCC) have this set to false.
+    pub mvcc_enabled: bool,
+    /// Table-level statistics (populated by ANALYZE TABLE).
+    pub stats: Option<TableStatistics>,
+    /// Per-column statistics (populated by ANALYZE TABLE).
+    pub column_stats: HashMap<String, ColumnStatistics>,
+}
+
+/// Metadata for a stored view.
+#[derive(Debug, Clone)]
+pub struct ViewInfo {
+    pub name: String,
+    pub sql: String,
+    pub column_aliases: Option<Vec<String>>,
 }
 
 /// In-memory catalog that tracks all tables in the database.
@@ -23,7 +39,8 @@ pub struct TableInfo {
 /// that table definitions survive across restarts.
 #[derive(Clone)]
 pub struct Catalog {
-    tables: HashMap<String, TableInfo>,
+    pub tables: HashMap<String, TableInfo>,
+    views: HashMap<String, ViewInfo>,
     next_table_id: u32,
     path: String,
 }
@@ -33,6 +50,7 @@ impl Catalog {
     pub fn new(path: &str) -> Self {
         Self {
             tables: HashMap::new(),
+            views: HashMap::new(),
             next_table_id: 0,
             path: path.to_string(),
         }
@@ -64,6 +82,9 @@ impl Catalog {
             name: name.to_string(),
             schema,
             first_page_id,
+            mvcc_enabled: true, // New tables get MVCC by default
+            stats: None,
+            column_stats: HashMap::new(),
         };
         self.tables.insert(key, info);
         Ok(table_id)
@@ -94,6 +115,46 @@ impl Catalog {
     /// Return references to all tables in the catalog (unordered).
     pub fn list_tables(&self) -> Vec<&TableInfo> {
         self.tables.values().collect()
+    }
+
+    /// Register a view.
+    pub fn create_view(&mut self, name: &str, sql: String, column_aliases: Option<Vec<String>>) -> Result<()> {
+        let key = name.to_lowercase();
+        if self.views.contains_key(&key) {
+            return Err(ForgeError::Catalog(format!("view '{}' already exists", name)));
+        }
+        self.views.insert(key, ViewInfo {
+            name: name.to_string(),
+            sql,
+            column_aliases,
+        });
+        Ok(())
+    }
+
+    /// Drop a view.
+    pub fn drop_view(&mut self, name: &str) -> Result<()> {
+        let key = name.to_lowercase();
+        self.views.remove(&key).ok_or_else(|| {
+            ForgeError::Catalog(format!("view '{}' not found", name))
+        })?;
+        Ok(())
+    }
+
+    /// Look up a view by name.
+    pub fn get_view(&self, name: &str) -> Option<&ViewInfo> {
+        self.views.get(&name.to_lowercase())
+    }
+
+    /// Modify a table's schema (for ALTER TABLE).
+    pub fn alter_table_schema<F>(&mut self, name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Schema) -> Result<()>,
+    {
+        let key = name.to_lowercase();
+        let info = self.tables.get_mut(&key).ok_or_else(|| {
+            ForgeError::Catalog(format!("table '{}' not found", name))
+        })?;
+        f(&mut info.schema)
     }
 
     // ------------------------------------------------------------------
@@ -142,6 +203,19 @@ impl Catalog {
                     DataType::Boolean => buf.push(3),
                     DataType::BigInt => buf.push(4),
                     DataType::DateTime => buf.push(5),
+                    DataType::Decimal(prec, scale) => {
+                        buf.push(6);
+                        buf.push(*prec);
+                        buf.push(*scale);
+                    }
+                    DataType::Date => buf.push(7),
+                    DataType::Time => buf.push(8),
+                    DataType::VarBinary(max_len) => {
+                        buf.push(9);
+                        buf.extend_from_slice(&max_len.to_le_bytes());
+                    }
+                    DataType::Json => buf.push(10),
+                    DataType::Uuid => buf.push(11),
                 }
 
                 // nullable
@@ -150,6 +224,9 @@ impl Catalog {
                 // column_id
                 buf.extend_from_slice(&col.column_id.to_le_bytes());
             }
+
+            // mvcc_enabled flag
+            buf.push(if info.mvcc_enabled { 1 } else { 0 });
         }
 
         fs::write(&self.path, &buf)?;
@@ -198,6 +275,19 @@ impl Catalog {
                     3 => DataType::Boolean,
                     4 => DataType::BigInt,
                     5 => DataType::DateTime,
+                    6 => {
+                        let prec = read_u8(&mut cur)?;
+                        let scale = read_u8(&mut cur)?;
+                        DataType::Decimal(prec, scale)
+                    }
+                    7 => DataType::Date,
+                    8 => DataType::Time,
+                    9 => {
+                        let max_len = read_u16(&mut cur)?;
+                        DataType::VarBinary(max_len)
+                    }
+                    10 => DataType::Json,
+                    11 => DataType::Uuid,
                     other => {
                         return Err(ForgeError::Catalog(format!(
                             "unknown data type tag: {}",
@@ -217,8 +307,13 @@ impl Catalog {
                     auto_increment: false,
                     default_value: None,
                     is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
                 });
             }
+
+            // Read mvcc_enabled flag (defaults to false for catalogs without this byte)
+            let mvcc_enabled = read_u8(&mut cur).unwrap_or(0) != 0;
 
             let key = name.to_lowercase();
             tables.insert(
@@ -228,12 +323,16 @@ impl Catalog {
                     name,
                     schema: Schema::new(columns),
                     first_page_id,
+                    mvcc_enabled,
+                    stats: None,
+                    column_stats: HashMap::new(),
                 },
             );
         }
 
         Ok(Self {
             tables,
+            views: HashMap::new(),
             next_table_id,
             path: path.to_string(),
         })
@@ -292,6 +391,8 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
             },
             Column {
                 name: "name".into(),
@@ -301,6 +402,8 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
             },
         ])
     }
@@ -406,6 +509,8 @@ mod tests {
                     auto_increment: false,
                     default_value: None,
                     is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
                 },
                 Column {
                     name: "score".into(),
@@ -415,6 +520,8 @@ mod tests {
                     auto_increment: false,
                     default_value: None,
                     is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
                 },
                 Column {
                     name: "label".into(),
@@ -424,6 +531,8 @@ mod tests {
                     auto_increment: false,
                     default_value: None,
                     is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
                 },
                 Column {
                     name: "active".into(),
@@ -433,6 +542,8 @@ mod tests {
                     auto_increment: false,
                     default_value: None,
                     is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
                 },
             ]);
 
@@ -444,6 +555,8 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
             }]);
 
             cat.create_table("Items", schema1, PageId(10)).unwrap();

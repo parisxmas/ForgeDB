@@ -18,6 +18,18 @@ pub enum DataType {
     Boolean,
     /// Date-time stored as i64 timestamp (seconds since epoch), 8 bytes.
     DateTime,
+    /// Fixed-precision decimal: (precision, scale). Stored as i64 unscaled + u8 scale.
+    Decimal(u8, u8),
+    /// Date only (days since epoch), 4 bytes.
+    Date,
+    /// Time only (seconds since midnight), 4 bytes.
+    Time,
+    /// Variable-length binary data.
+    VarBinary(u16),
+    /// JSON stored as string internally.
+    Json,
+    /// UUID stored as string internally.
+    Uuid,
 }
 
 /// A runtime value that can be stored in a tuple column.
@@ -29,6 +41,18 @@ pub enum Value {
     Varchar(String),
     Boolean(bool),
     DateTime(i64), // seconds since epoch
+    /// Decimal: (unscaled_value, scale). E.g. 123.45 => (12345, 2)
+    Decimal(i64, u8),
+    /// Date: days since Unix epoch
+    Date(i32),
+    /// Time: seconds since midnight
+    Time(i32),
+    /// Binary data
+    Binary(Vec<u8>),
+    /// JSON stored as string
+    Json(String),
+    /// UUID stored as string
+    Uuid(String),
     Null,
 }
 
@@ -48,6 +72,12 @@ impl Value {
             Value::Varchar(s) => Some(DataType::Varchar(s.len() as u16)),
             Value::Boolean(_) => Some(DataType::Boolean),
             Value::DateTime(_) => Some(DataType::DateTime),
+            Value::Decimal(_, scale) => Some(DataType::Decimal(18, *scale)),
+            Value::Date(_) => Some(DataType::Date),
+            Value::Time(_) => Some(DataType::Time),
+            Value::Binary(b) => Some(DataType::VarBinary(b.len() as u16)),
+            Value::Json(_) => Some(DataType::Json),
+            Value::Uuid(_) => Some(DataType::Uuid),
             Value::Null => None,
         }
     }
@@ -82,6 +112,47 @@ impl Value {
 
             (Value::Varchar(a), Value::Varchar(b)) => Some(a.cmp(b)),
             (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+
+            // Decimal comparisons
+            (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+                // Normalize to same scale for comparison
+                if sa == sb {
+                    a.partial_cmp(b)
+                } else if sa > sb {
+                    let factor = 10i64.pow((*sa - *sb) as u32);
+                    a.partial_cmp(&(b * factor))
+                } else {
+                    let factor = 10i64.pow((*sb - *sa) as u32);
+                    (a * factor).partial_cmp(b)
+                }
+            }
+            (Value::Decimal(a, sa), Value::Integer(b)) => {
+                let factor = 10i64.pow(*sa as u32);
+                a.partial_cmp(&((*b as i64) * factor))
+            }
+            (Value::Integer(a), Value::Decimal(b, sb)) => {
+                let factor = 10i64.pow(*sb as u32);
+                ((*a as i64) * factor).partial_cmp(b)
+            }
+            (Value::Decimal(a, sa), Value::Float(b)) => {
+                let f = *a as f64 / 10f64.powi(*sa as i32);
+                f.partial_cmp(b)
+            }
+            (Value::Float(a), Value::Decimal(b, sb)) => {
+                let f = *b as f64 / 10f64.powi(*sb as i32);
+                a.partial_cmp(&f)
+            }
+
+            // Date/Time comparisons
+            (Value::Date(a), Value::Date(b)) => a.partial_cmp(b),
+            (Value::Time(a), Value::Time(b)) => a.partial_cmp(b),
+
+            // JSON/UUID compare as strings
+            (Value::Json(a), Value::Json(b)) => Some(a.cmp(b)),
+            (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+
+            // Binary compare
+            (Value::Binary(a), Value::Binary(b)) => Some(a.cmp(b)),
 
             _ => None,
         }
@@ -119,6 +190,26 @@ impl Value {
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a + *b as f64)),
             (Value::BigInt(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::BigInt(b)) => Ok(Value::Float(a + *b as f64)),
+            // Decimal arithmetic
+            (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+                if sa == sb {
+                    Ok(Value::Decimal(a + b, *sa))
+                } else if sa > sb {
+                    let factor = 10i64.pow((*sa - *sb) as u32);
+                    Ok(Value::Decimal(a + b * factor, *sa))
+                } else {
+                    let factor = 10i64.pow((*sb - *sa) as u32);
+                    Ok(Value::Decimal(a * factor + b, *sb))
+                }
+            }
+            (Value::Decimal(a, sa), Value::Integer(b)) => {
+                let factor = 10i64.pow(*sa as u32);
+                Ok(Value::Decimal(a + (*b as i64) * factor, *sa))
+            }
+            (Value::Integer(a), Value::Decimal(b, sb)) => {
+                let factor = 10i64.pow(*sb as u32);
+                Ok(Value::Decimal((*a as i64) * factor + b, *sb))
+            }
             _ => Err(ForgeError::Tuple(format!(
                 "cannot add {:?} and {:?}",
                 self, other
@@ -154,6 +245,25 @@ impl Value {
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a - *b as f64)),
             (Value::BigInt(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::BigInt(b)) => Ok(Value::Float(a - *b as f64)),
+            (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+                if sa == sb {
+                    Ok(Value::Decimal(a - b, *sa))
+                } else if sa > sb {
+                    let factor = 10i64.pow((*sa - *sb) as u32);
+                    Ok(Value::Decimal(a - b * factor, *sa))
+                } else {
+                    let factor = 10i64.pow((*sb - *sa) as u32);
+                    Ok(Value::Decimal(a * factor - b, *sb))
+                }
+            }
+            (Value::Decimal(a, sa), Value::Integer(b)) => {
+                let factor = 10i64.pow(*sa as u32);
+                Ok(Value::Decimal(a - (*b as i64) * factor, *sa))
+            }
+            (Value::Integer(a), Value::Decimal(b, sb)) => {
+                let factor = 10i64.pow(*sb as u32);
+                Ok(Value::Decimal((*a as i64) * factor - b, *sb))
+            }
             _ => Err(ForgeError::Tuple(format!(
                 "cannot subtract {:?} and {:?}",
                 self, other
@@ -189,6 +299,15 @@ impl Value {
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a * *b as f64)),
             (Value::BigInt(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::BigInt(b)) => Ok(Value::Float(a * *b as f64)),
+            (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+                Ok(Value::Decimal(a * b / 10i64.pow(*sb as u32), *sa))
+            }
+            (Value::Decimal(a, sa), Value::Integer(b)) => {
+                Ok(Value::Decimal(a * (*b as i64), *sa))
+            }
+            (Value::Integer(a), Value::Decimal(b, sb)) => {
+                Ok(Value::Decimal((*a as i64) * b, *sb))
+            }
             _ => Err(ForgeError::Tuple(format!(
                 "cannot multiply {:?} and {:?}",
                 self, other
@@ -327,9 +446,52 @@ impl Value {
             Value::DateTime(v) => {
                 let mut buf = Vec::with_capacity(9);
                 buf.push(0x07);
-                // Same sign-bit flipping as BigInt for ordering.
                 let flipped = (*v as u64) ^ 0x8000_0000_0000_0000;
                 buf.extend_from_slice(&flipped.to_be_bytes());
+                buf
+            }
+
+            Value::Decimal(v, _scale) => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(0x08);
+                let flipped = (*v as u64) ^ 0x8000_0000_0000_0000;
+                buf.extend_from_slice(&flipped.to_be_bytes());
+                buf
+            }
+
+            Value::Date(v) => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(0x09);
+                let flipped = (*v as u32) ^ 0x8000_0000;
+                buf.extend_from_slice(&flipped.to_be_bytes());
+                buf
+            }
+
+            Value::Time(v) => {
+                let mut buf = Vec::with_capacity(5);
+                buf.push(0x0A);
+                buf.extend_from_slice(&(*v as u32).to_be_bytes());
+                buf
+            }
+
+            Value::Binary(b) => {
+                let mut buf = Vec::with_capacity(1 + b.len());
+                buf.push(0x0B);
+                buf.extend_from_slice(b);
+                buf
+            }
+
+            Value::Json(s) => {
+                let mut buf = Vec::with_capacity(1 + s.len());
+                buf.push(0x0C);
+                buf.extend_from_slice(s.as_bytes());
+                buf
+            }
+
+            Value::Uuid(s) => {
+                let mut buf = Vec::with_capacity(1 + s.len());
+                buf.push(0x0D);
+                buf.extend_from_slice(s.as_bytes());
                 buf
             }
         }
@@ -349,6 +511,41 @@ impl fmt::Display for Value {
             Value::Varchar(v) => write!(f, "{}", v),
             Value::Boolean(v) => write!(f, "{}", v),
             Value::DateTime(epoch) => write!(f, "{}", format_epoch_datetime(*epoch)),
+            Value::Decimal(unscaled, scale) => {
+                if *scale == 0 {
+                    write!(f, "{}", unscaled)
+                } else {
+                    let divisor = 10i64.pow(*scale as u32);
+                    let int_part = unscaled / divisor;
+                    let frac_part = (unscaled % divisor).unsigned_abs();
+                    if *unscaled < 0 && int_part == 0 {
+                        write!(f, "-0.{:0>width$}", frac_part, width = *scale as usize)
+                    } else {
+                        write!(f, "{}.{:0>width$}", int_part, frac_part, width = *scale as usize)
+                    }
+                }
+            }
+            Value::Date(days) => {
+                let epoch = (*days as i64) * 86400;
+                let s = format_epoch_datetime(epoch);
+                // Return only the date portion
+                write!(f, "{}", &s[..10])
+            }
+            Value::Time(secs) => {
+                let h = secs / 3600;
+                let m = (secs % 3600) / 60;
+                let s = secs % 60;
+                write!(f, "{:02}:{:02}:{:02}", h, m, s)
+            }
+            Value::Binary(b) => {
+                write!(f, "0x")?;
+                for byte in b {
+                    write!(f, "{:02X}", byte)?;
+                }
+                Ok(())
+            }
+            Value::Json(s) => write!(f, "{}", s),
+            Value::Uuid(s) => write!(f, "{}", s),
             Value::Null => write!(f, "NULL"),
         }
     }

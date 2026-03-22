@@ -1,2 +1,32 @@
-/target
+# Rust
+/target/
+**/*.rs.bk
+
+# .NET
+dotnet-tests/**/bin/
+dotnet-tests/**/obj/
+dotnet-tests/**/*.user
+dotnet-tests/**/.vs/
+
+# PHP
+/vendor/
+composer.lock
+*.phar
+.phpunit.result.cache
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude
 .claude
+
+# Database runtime files
+forgedb_data/
+
+# OS
+.DS_Store
+Thumbs.db

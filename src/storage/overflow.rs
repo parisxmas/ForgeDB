@@ -58,18 +58,17 @@ pub fn read_overflow(bpm: &mut LocalBpm, first_page_id: PageId) -> Result<Vec<u8
 
     loop {
         bpm.fetch_page(current)?;
-        let (next_pid, chunk) = {
+        let next_pid = {
             let page = bpm.get_page(current);
             let next = u32::from_le_bytes([
                 page.data[0], page.data[1], page.data[2], page.data[3],
             ]);
             let len = u16::from_le_bytes([page.data[4], page.data[5]]) as usize;
-            let chunk = page.data[OVERFLOW_HEADER..OVERFLOW_HEADER + len].to_vec();
-            (next, chunk)
+            // Extend directly from page data — no intermediate Vec allocation
+            result.extend_from_slice(&page.data[OVERFLOW_HEADER..OVERFLOW_HEADER + len]);
+            next
         };
         bpm.unpin_page(current, false)?;
-
-        result.extend_from_slice(&chunk);
 
         if next_pid == INVALID_PAGE_ID {
             break;

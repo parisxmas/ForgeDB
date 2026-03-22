@@ -1,3 +1,4 @@
+use crate::sql::ast::Expr;
 use crate::tuple::types::{DataType, Value};
 
 /// Describes a single column in a table schema.
@@ -10,6 +11,11 @@ pub struct Column {
     pub auto_increment: bool,
     pub default_value: Option<Value>,
     pub is_primary_key: bool,
+    pub is_unique: bool,
+    pub check_expr: Option<Expr>,
+    /// Foreign key reference: (parent_table, parent_column, on_delete_action)
+    /// on_delete: 0=Restrict, 1=Cascade, 2=SetNull
+    pub fk_ref: Option<(String, String, u8)>,
 }
 
 /// An ordered collection of [`Column`] definitions that describes the shape of
@@ -77,6 +83,8 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 is_primary_key: false,
+                is_unique: false,
+                check_expr: None, fk_ref: None,
             },
             Column {
                 name: "Name".into(),
@@ -86,6 +94,8 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 is_primary_key: false,
+                is_unique: false,
+                check_expr: None, fk_ref: None,
             },
             Column {
                 name: "Active".into(),
@@ -95,6 +105,8 @@ mod tests {
                 auto_increment: false,
                 default_value: None,
                 is_primary_key: false,
+                is_unique: false,
+                check_expr: None, fk_ref: None,
             },
         ])
     }

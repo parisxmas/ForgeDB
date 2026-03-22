@@ -1,8 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::*;
 use crate::error::{ForgeError, Result};
 use crate::storage::local_bpm::LocalBpm;
+use super::mvcc::Snapshot;
+use super::undo::UndoLog;
 use super::wal::{Wal, WalRecord};
 
 /// Manages transactions: begin, commit, abort, WAL logging, and crash recovery.
@@ -10,6 +12,8 @@ pub struct TransactionManager {
     next_txn_id: u64,
     active_txns: HashSet<TxnId>,
     wal: Wal,
+    /// Undo logs for active transactions (used for ROLLBACK).
+    undo_logs: HashMap<TxnId, UndoLog>,
 }
 
 impl TransactionManager {
@@ -20,6 +24,7 @@ impl TransactionManager {
             next_txn_id: 1,
             active_txns: HashSet::new(),
             wal,
+            undo_logs: HashMap::new(),
         })
     }
 
@@ -28,6 +33,7 @@ impl TransactionManager {
         let txn_id = TxnId(self.next_txn_id);
         self.next_txn_id += 1;
         self.active_txns.insert(txn_id);
+        self.undo_logs.insert(txn_id, UndoLog::new());
         self.wal.append(&WalRecord::Begin(txn_id))?;
         Ok(txn_id)
     }
@@ -42,6 +48,7 @@ impl TransactionManager {
         }
         self.wal.append(&WalRecord::Commit(txn_id))?;
         self.active_txns.remove(&txn_id);
+        self.undo_logs.remove(&txn_id);
         Ok(())
     }
 
@@ -55,7 +62,49 @@ impl TransactionManager {
         }
         self.wal.append(&WalRecord::Abort(txn_id))?;
         self.active_txns.remove(&txn_id);
+        self.undo_logs.remove(&txn_id);
         Ok(())
+    }
+
+    /// Take a consistent snapshot of the current transaction state.
+    pub fn take_snapshot(&self, txn_id: TxnId) -> Snapshot {
+        let xmin = self.active_txns.iter().map(|t| t.0).min().unwrap_or(self.next_txn_id);
+        Snapshot {
+            txn_id,
+            active_txns: self.active_txns.clone(),
+            xmin,
+            xmax: self.next_txn_id,
+        }
+    }
+
+    /// Get a mutable reference to the undo log for a transaction.
+    pub fn get_undo_log(&mut self, txn_id: TxnId) -> Option<&mut UndoLog> {
+        self.undo_logs.get_mut(&txn_id)
+    }
+
+    /// Get an immutable reference to the undo log for a transaction.
+    pub fn get_undo_log_ref(&self, txn_id: TxnId) -> Option<&UndoLog> {
+        self.undo_logs.get(&txn_id)
+    }
+
+    /// Take the undo log out of the manager (for rollback processing).
+    pub fn take_undo_log(&mut self, txn_id: TxnId) -> Option<UndoLog> {
+        self.undo_logs.remove(&txn_id)
+    }
+
+    /// Put an undo log back into the manager (for savepoint partial rollback).
+    pub fn put_undo_log(&mut self, txn_id: TxnId, log: UndoLog) {
+        self.undo_logs.insert(txn_id, log);
+    }
+
+    /// Get the next transaction ID (for snapshot purposes).
+    pub fn next_txn_id(&self) -> u64 {
+        self.next_txn_id
+    }
+
+    /// Check if a transaction is active.
+    pub fn is_active(&self, txn_id: TxnId) -> bool {
+        self.active_txns.contains(&txn_id)
     }
 
     /// Log a page write (before/after images) for the given transaction.
@@ -83,10 +132,16 @@ impl TransactionManager {
 
     /// Redo-only recovery: read all WAL records, determine which transactions
     /// committed, then replay their PageWrite after-images via the buffer pool.
+    ///
+    /// Two-pass approach:
+    /// Pass 1: scan for Commit records (only stores TxnId, not full records)
+    /// Pass 2: replay PageWrite after-images for committed transactions
+    /// Each PageWrite record is processed and dropped immediately — we don't
+    /// hold all records in memory simultaneously.
     pub fn recover(&mut self, bpm: &mut LocalBpm) -> Result<()> {
         let records = self.wal.read_all_records()?;
 
-        // First pass: determine which transactions committed.
+        // First pass: determine which transactions committed (cheap — only stores u64s).
         let mut committed: HashSet<TxnId> = HashSet::new();
         for record in &records {
             if let WalRecord::Commit(txn_id) = record {
@@ -95,7 +150,9 @@ impl TransactionManager {
         }
 
         // Second pass: redo page writes for committed transactions.
-        for record in &records {
+        for record in records {
+            // `record` is moved, so each WalRecord (including its Box<[u8; PAGE_SIZE]>)
+            // is dropped at the end of each loop iteration — not accumulated.
             if let WalRecord::PageWrite {
                 txn_id,
                 page_id,
@@ -103,14 +160,13 @@ impl TransactionManager {
                 ..
             } = record
             {
-                if committed.contains(txn_id) {
-                    // Fetch the page into the buffer pool, apply the after-image,
-                    // then unpin as dirty so it will be flushed.
-                    bpm.fetch_page(*page_id)?;
-                    let page = bpm.get_page_mut(*page_id);
+                if committed.contains(&txn_id) {
+                    bpm.fetch_page(page_id)?;
+                    let page = bpm.get_page_mut(page_id);
                     page.data.copy_from_slice(after_image.as_ref());
-                    bpm.unpin_page(*page_id, true)?;
+                    bpm.unpin_page(page_id, true)?;
                 }
+                // after_image (Box<[u8; 16384]>) and before_image dropped here
             }
         }
 

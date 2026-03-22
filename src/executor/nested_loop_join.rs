@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::common::{PageId, RID};
 use crate::error::Result;
 use crate::sql::ast::{Expr, JoinType};
@@ -26,6 +28,8 @@ pub fn execute_nested_loop_join(
             auto_increment: false,
             default_value: None,
             is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
         });
     }
     for col in &right_schema.columns {
@@ -37,6 +41,8 @@ pub fn execute_nested_loop_join(
             auto_increment: false,
             default_value: None,
             is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
         });
     }
     let combined_schema = Schema::new(combined_columns);
@@ -94,6 +100,50 @@ pub fn execute_nested_loop_join(
                 if !matched {
                     let mut combined: Vec<Value> =
                         std::iter::repeat(Value::Null).take(left_null_count).collect();
+                    combined.extend(rvals.iter().cloned());
+                    result.push((dummy_rid, combined));
+                }
+            }
+        }
+        JoinType::Full => {
+            // FULL OUTER JOIN:
+            // 1. LEFT JOIN pass, tracking which right rows matched
+            // 2. Append unmatched right rows with NULLs for left columns
+            let mut matched_right: HashSet<usize> = HashSet::new();
+
+            for (_, lvals) in left_rows {
+                let mut matched = false;
+                for (ri, (_, rvals)) in right_rows.iter().enumerate() {
+                    let mut combined = lvals.clone();
+                    combined.extend(rvals.iter().cloned());
+                    if eval_to_bool(on, &combined, &combined_schema)? {
+                        result.push((dummy_rid, combined));
+                        matched = true;
+                        matched_right.insert(ri);
+                    }
+                }
+                if !matched {
+                    let mut combined = lvals.clone();
+                    combined.extend(std::iter::repeat(Value::Null).take(right_null_count));
+                    result.push((dummy_rid, combined));
+                }
+            }
+
+            // Add unmatched right rows
+            for (ri, (_, rvals)) in right_rows.iter().enumerate() {
+                if !matched_right.contains(&ri) {
+                    let mut combined: Vec<Value> =
+                        std::iter::repeat(Value::Null).take(left_null_count).collect();
+                    combined.extend(rvals.iter().cloned());
+                    result.push((dummy_rid, combined));
+                }
+            }
+        }
+        JoinType::Cross => {
+            // CROSS JOIN: Cartesian product, ignore ON condition
+            for (_, lvals) in left_rows {
+                for (_, rvals) in right_rows {
+                    let mut combined = lvals.clone();
                     combined.extend(rvals.iter().cloned());
                     result.push((dummy_rid, combined));
                 }

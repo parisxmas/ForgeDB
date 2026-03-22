@@ -35,6 +35,16 @@ pub fn execute_create_table(
                 auto_increment: cd.auto_increment,
                 default_value,
                 is_primary_key: cd.is_primary_key,
+                is_unique: cd.is_unique,
+                check_expr: cd.check_expr.clone(),
+                fk_ref: cd.references.as_ref().map(|r| {
+                    let action = match r.on_delete {
+                        crate::sql::ast::FkAction::Restrict => 0u8,
+                        crate::sql::ast::FkAction::Cascade => 1u8,
+                        crate::sql::ast::FkAction::SetNull => 2u8,
+                    };
+                    (r.table.clone(), r.column.clone(), action)
+                }),
             }
         })
         .collect();

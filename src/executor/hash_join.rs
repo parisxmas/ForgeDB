@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::{PageId, RID};
-use crate::error::{ForgeError, Result};
+use crate::error::Result;
 use crate::sql::ast::{BinaryOperator, Expr, JoinType};
 use crate::tuple::schema::{Column, Schema};
 use crate::tuple::types::Value;
@@ -71,6 +71,53 @@ fn extract_column_index(
     None
 }
 
+/// Execute a join with an optional ON condition.
+///
+/// For CROSS JOIN, `on` should be `None` (produces Cartesian product).
+/// For all other join types, delegates to `execute_hash_join` with the ON condition.
+pub fn execute_join(
+    left_rows: &[(RID, Vec<Value>)],
+    right_rows: &[(RID, Vec<Value>)],
+    join_type: &JoinType,
+    on: &Option<Expr>,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Result<(Schema, Vec<(RID, Vec<Value>)>)> {
+    let combined_schema = build_combined_schema(left_schema, right_schema);
+    let dummy_rid = RID { page_id: PageId(0), slot_id: 0 };
+
+    match (join_type, on) {
+        // CROSS JOIN: Cartesian product, no ON condition needed
+        (JoinType::Cross, _) => {
+            let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
+            for (_, lvals) in left_rows {
+                for (_, rvals) in right_rows {
+                    let mut combined = lvals.clone();
+                    combined.extend(rvals.iter().cloned());
+                    result.push((dummy_rid, combined));
+                }
+            }
+            Ok((combined_schema, result))
+        }
+        // Other join types with an ON condition
+        (_, Some(expr)) => {
+            execute_hash_join(left_rows, right_rows, join_type, expr, left_schema, right_schema)
+        }
+        // Non-CROSS join without ON condition: treat as CROSS (Cartesian product)
+        (_, None) => {
+            let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
+            for (_, lvals) in left_rows {
+                for (_, rvals) in right_rows {
+                    let mut combined = lvals.clone();
+                    combined.extend(rvals.iter().cloned());
+                    result.push((dummy_rid, combined));
+                }
+            }
+            Ok((combined_schema, result))
+        }
+    }
+}
+
 /// Execute a hash join for equi-join conditions.
 /// Falls back to nested-loop for non-equi joins.
 pub fn execute_hash_join(
@@ -86,6 +133,19 @@ pub fn execute_hash_join(
     let dummy_rid = RID { page_id: PageId(0), slot_id: 0 };
     let right_null_count = right_schema.columns.len();
     let left_null_count = left_schema.columns.len();
+
+    // CROSS JOIN: Cartesian product (ignore ON condition)
+    if matches!(join_type, JoinType::Cross) {
+        let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
+        for (_, lvals) in left_rows {
+            for (_, rvals) in right_rows {
+                let mut combined = lvals.clone();
+                combined.extend(rvals.iter().cloned());
+                result.push((dummy_rid, combined));
+            }
+        }
+        return Ok((combined_schema, result));
+    }
 
     // Try equi-join optimization
     if let Some((left_key_idx, right_key_idx)) = extract_equi_join_keys(on, left_schema, right_schema) {
@@ -196,6 +256,58 @@ pub fn execute_hash_join(
                     }
                 }
             }
+            JoinType::Full => {
+                // FULL OUTER JOIN with equi-join optimization:
+                // 1. Do a LEFT JOIN, tracking which right rows matched
+                // 2. Append unmatched right rows with NULLs for left columns
+                let mut right_hash: HashMap<HashKey, Vec<usize>> =
+                    HashMap::with_capacity(right_rows.len());
+                for (i, (_, rvals)) in right_rows.iter().enumerate() {
+                    if right_key_idx < rvals.len() {
+                        let key = HashKey::from_value(&rvals[right_key_idx]);
+                        right_hash.entry(key).or_default().push(i);
+                    }
+                }
+
+                let mut matched_right: HashSet<usize> = HashSet::new();
+
+                // LEFT JOIN pass
+                for (_, lvals) in left_rows {
+                    let key = if left_key_idx < lvals.len() {
+                        HashKey::from_value(&lvals[left_key_idx])
+                    } else {
+                        HashKey::Null
+                    };
+                    if let Some(indices) = right_hash.get(&key) {
+                        for &ri in indices {
+                            matched_right.insert(ri);
+                            let mut combined = Vec::with_capacity(combined_width);
+                            combined.extend_from_slice(lvals);
+                            combined.extend_from_slice(&right_rows[ri].1);
+                            result.push((dummy_rid, combined));
+                        }
+                    } else {
+                        let mut combined = Vec::with_capacity(combined_width);
+                        combined.extend_from_slice(lvals);
+                        combined.extend(std::iter::repeat(Value::Null).take(right_null_count));
+                        result.push((dummy_rid, combined));
+                    }
+                }
+
+                // Add unmatched right rows
+                for (ri, (_, rvals)) in right_rows.iter().enumerate() {
+                    if !matched_right.contains(&ri) {
+                        let mut combined = Vec::with_capacity(combined_width);
+                        combined.extend(std::iter::repeat(Value::Null).take(left_null_count));
+                        combined.extend_from_slice(rvals);
+                        result.push((dummy_rid, combined));
+                    }
+                }
+            }
+            JoinType::Cross => {
+                // Already handled above, but match for completeness
+                unreachable!("CROSS JOIN handled before equi-join path");
+            }
         }
 
         return Ok((combined_schema, result));
@@ -252,9 +364,58 @@ pub fn execute_hash_join(
                 }
             }
         }
+        JoinType::Full => {
+            // FULL OUTER JOIN nested-loop fallback:
+            // 1. Do a LEFT JOIN pass, tracking which right rows matched
+            // 2. Append unmatched right rows with NULLs for left columns
+            let mut matched_right: HashSet<usize> = HashSet::new();
+
+            for (_, lvals) in left_rows {
+                let mut matched = false;
+                for (ri, (_, rvals)) in right_rows.iter().enumerate() {
+                    let mut combined = lvals.clone();
+                    combined.extend(rvals.iter().cloned());
+                    if eval_to_bool(on, &combined, &combined_schema)? {
+                        result.push((dummy_rid, combined));
+                        matched = true;
+                        matched_right.insert(ri);
+                    }
+                }
+                if !matched {
+                    let mut combined = lvals.clone();
+                    combined.extend(std::iter::repeat(Value::Null).take(right_null_count));
+                    result.push((dummy_rid, combined));
+                }
+            }
+
+            // Add unmatched right rows
+            for (ri, (_, rvals)) in right_rows.iter().enumerate() {
+                if !matched_right.contains(&ri) {
+                    let mut combined: Vec<Value> =
+                        std::iter::repeat(Value::Null).take(left_null_count).collect();
+                    combined.extend(rvals.iter().cloned());
+                    result.push((dummy_rid, combined));
+                }
+            }
+        }
+        JoinType::Cross => {
+            // CROSS JOIN: Cartesian product (ignore ON condition)
+            for (_, lvals) in left_rows {
+                for (_, rvals) in right_rows {
+                    let mut combined = lvals.clone();
+                    combined.extend(rvals.iter().cloned());
+                    result.push((dummy_rid, combined));
+                }
+            }
+        }
     }
 
     Ok((combined_schema, result))
+}
+
+/// Public version of build_combined_schema for use by grace_hash_join.
+pub fn build_combined_schema_pub(left: &Schema, right: &Schema) -> Schema {
+    build_combined_schema(left, right)
 }
 
 fn build_combined_schema(left: &Schema, right: &Schema) -> Schema {
@@ -268,6 +429,8 @@ fn build_combined_schema(left: &Schema, right: &Schema) -> Schema {
             auto_increment: false,
             default_value: None,
             is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
         });
     }
     for col in &right.columns {
@@ -279,6 +442,8 @@ fn build_combined_schema(left: &Schema, right: &Schema) -> Schema {
             auto_increment: false,
             default_value: None,
             is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
         });
     }
     Schema::new(cols)
@@ -303,6 +468,12 @@ impl HashKey {
             Value::Varchar(s) => HashKey::Str(s.clone()),
             Value::Boolean(b) => HashKey::Bool(*b),
             Value::DateTime(t) => HashKey::BigInt(*t),
+            Value::Decimal(v, _) => HashKey::BigInt(*v),
+            Value::Date(d) => HashKey::Integer(*d),
+            Value::Time(t) => HashKey::Integer(*t),
+            Value::Binary(_) => HashKey::Str(v.to_string()),
+            Value::Json(s) => HashKey::Str(s.clone()),
+            Value::Uuid(s) => HashKey::Str(s.clone()),
             Value::Null => HashKey::Null,
         }
     }

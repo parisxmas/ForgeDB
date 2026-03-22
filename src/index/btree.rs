@@ -8,19 +8,56 @@
 //! Deletion uses lazy removal: the entry is simply deleted from the leaf
 //! without any rebalancing.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::common::{PageId, RID, TableId, INVALID_PAGE_ID};
 use crate::error::{ForgeError, Result};
 use crate::index::btree_page;
 use crate::storage::local_bpm::LocalBpm;
 use crate::tuple::types::{DataType, Value};
 
-/// A B-tree index over a single column of a table.
-#[derive(Clone)]
+/// A B-tree index over one or more columns of a table.
 pub struct BTreeIndex {
-    pub root_page_id: PageId,
+    /// Root page — stored as AtomicU32 so insert/delete can take &self,
+    /// enabling concurrent DML with only a read lock on the index Vec.
+    root_page_id_atomic: AtomicU32,
     pub key_type: DataType,
     pub table_id: TableId,
     pub key_column_index: usize,
+    /// For composite indexes: names of all key columns (in order).
+    /// Empty for single-column indexes (backward compatibility).
+    pub key_columns: Vec<String>,
+    /// Covering index: additional non-key columns stored in the index
+    /// so that queries needing only these columns + key columns can be
+    /// answered without a heap lookup (index-only scan).
+    pub include_columns: Vec<String>,
+}
+
+impl Clone for BTreeIndex {
+    fn clone(&self) -> Self {
+        Self {
+            root_page_id_atomic: AtomicU32::new(self.root_page_id_atomic.load(Ordering::Relaxed)),
+            key_type: self.key_type.clone(),
+            table_id: self.table_id,
+            key_column_index: self.key_column_index,
+            key_columns: self.key_columns.clone(),
+            include_columns: self.include_columns.clone(),
+        }
+    }
+}
+
+impl BTreeIndex {
+    /// Get the current root page ID.
+    #[inline]
+    pub fn root_page_id(&self) -> PageId {
+        PageId(self.root_page_id_atomic.load(Ordering::Relaxed))
+    }
+
+    /// Set the root page ID (used during creation / deserialization).
+    #[inline]
+    fn set_root_page_id(&self, pid: PageId) {
+        self.root_page_id_atomic.store(pid.0, Ordering::Relaxed);
+    }
 }
 
 impl BTreeIndex {
@@ -32,10 +69,12 @@ impl BTreeIndex {
         key_column_index: usize,
     ) -> Self {
         Self {
-            root_page_id,
+            root_page_id_atomic: AtomicU32::new(root_page_id.0),
             key_type,
             table_id,
             key_column_index,
+            key_columns: Vec::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -55,11 +94,60 @@ impl BTreeIndex {
         bpm.unpin_page(page_id, true)?;
 
         Ok(Self {
-            root_page_id: page_id,
+            root_page_id_atomic: AtomicU32::new(page_id.0),
             key_type,
             table_id,
             key_column_index,
+            key_columns: Vec::new(),
+            include_columns: Vec::new(),
         })
+    }
+
+    /// Create a composite index over multiple columns.
+    pub fn create_composite(
+        bpm: &mut LocalBpm,
+        key_type: DataType,
+        table_id: TableId,
+        key_column_index: usize,
+        key_columns: Vec<String>,
+        include_columns: Vec<String>,
+    ) -> Result<Self> {
+        let page_id = bpm.new_page()?;
+        {
+            let page = bpm.get_page_mut(page_id);
+            btree_page::leaf_init(&mut page.data);
+        }
+        bpm.unpin_page(page_id, true)?;
+
+        Ok(Self {
+            root_page_id_atomic: AtomicU32::new(page_id.0),
+            key_type,
+            table_id,
+            key_column_index,
+            key_columns,
+            include_columns,
+        })
+    }
+
+    /// Check if this index covers all the requested columns (for index-only scans).
+    /// A covering index has all requested columns in either its key columns or include columns.
+    pub fn covers_columns(&self, requested_columns: &[String]) -> bool {
+        if self.key_columns.is_empty() && self.include_columns.is_empty() {
+            return false;
+        }
+
+        let mut covered: Vec<String> = self.key_columns.iter().map(|c| c.to_lowercase()).collect();
+        covered.extend(self.include_columns.iter().map(|c| c.to_lowercase()));
+
+        requested_columns.iter().all(|col| {
+            let col_lower = col.to_lowercase();
+            covered.iter().any(|c| *c == col_lower)
+        })
+    }
+
+    /// Check if this is a composite (multi-column) index.
+    pub fn is_composite(&self) -> bool {
+        self.key_columns.len() > 1
     }
 
     // -----------------------------------------------------------------------
@@ -84,7 +172,7 @@ impl BTreeIndex {
 
     /// Insert a (key, RID) pair into the index. Splits pages as needed.
     pub fn insert(
-        &mut self,
+        &self,
         bpm: &mut LocalBpm,
         key: &Value,
         rid: RID,
@@ -166,14 +254,14 @@ impl BTreeIndex {
     /// parent of `left_page_id`. If `left_page_id` is the root and has no
     /// parent, a new root is created.
     fn insert_into_parent(
-        &mut self,
+        &self,
         bpm: &mut LocalBpm,
         left_page_id: PageId,
         key: &[u8],
         right_page_id: PageId,
     ) -> Result<()> {
         // If left is the current root, create a new root.
-        if left_page_id == self.root_page_id {
+        if left_page_id == self.root_page_id() {
             let new_root_id = bpm.new_page()?;
             {
                 let page = bpm.get_page_mut(new_root_id);
@@ -182,12 +270,12 @@ impl BTreeIndex {
                 btree_page::internal_insert(&mut page.data, key, right_page_id.0);
             }
             bpm.unpin_page(new_root_id, true)?;
-            self.root_page_id = new_root_id;
+            self.set_root_page_id(new_root_id);
             return Ok(());
         }
 
         // Otherwise, find the parent by traversing from the root.
-        let parent_id = self.find_parent(bpm, self.root_page_id, left_page_id)?;
+        let parent_id = self.find_parent(bpm, self.root_page_id(), left_page_id)?;
 
         bpm.fetch_page(parent_id)?;
         let has_room = {
@@ -265,7 +353,7 @@ impl BTreeIndex {
     /// Delete the entry with the given key. Returns `true` if found.
     /// No rebalancing is performed (lazy deletion).
     pub fn delete(
-        &mut self,
+        &self,
         bpm: &mut LocalBpm,
         key: &Value,
     ) -> Result<bool> {
@@ -350,7 +438,7 @@ impl BTreeIndex {
     /// Traverse from the root to find the leaf page that should contain the
     /// given key.
     fn find_leaf(&self, bpm: &mut LocalBpm, key: &[u8]) -> Result<PageId> {
-        let mut current_id = self.root_page_id;
+        let mut current_id = self.root_page_id();
 
         loop {
             bpm.fetch_page(current_id)?;
@@ -368,7 +456,7 @@ impl BTreeIndex {
 
     /// Find the leftmost leaf by always following child_0.
     fn find_leftmost_leaf(&self, bpm: &mut LocalBpm) -> Result<PageId> {
-        let mut current_id = self.root_page_id;
+        let mut current_id = self.root_page_id();
 
         loop {
             bpm.fetch_page(current_id)?;
@@ -531,13 +619,14 @@ mod tests {
         }
 
         // Verify the root is no longer a leaf (it must have been split).
-        bpm.fetch_page(idx.root_page_id).unwrap();
-        let root_page = bpm.get_page(idx.root_page_id);
+        let root_pid = idx.root_page_id();
+        bpm.fetch_page(root_pid).unwrap();
+        let root_page = bpm.get_page(root_pid);
         assert!(
             btree_page::is_internal(&root_page.data),
             "root should be internal after splits"
         );
-        bpm.unpin_page(idx.root_page_id, false).unwrap();
+        bpm.unpin_page(root_pid, false).unwrap();
 
         // Verify all keys are findable.
         for i in 0..n {

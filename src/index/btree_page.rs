@@ -174,7 +174,10 @@ pub fn leaf_insert(page: &mut [u8; PAGE_SIZE], key: &[u8], rid: RID) -> bool {
     // Find insertion position via linear scan (keys are sorted).
     let mut insert_pos: usize = n;
     for i in 0..n {
-        let existing_key = leaf_get_key(page, i as u16).unwrap();
+        let existing_key = match leaf_get_key(page, i as u16) {
+            Some(k) => k,
+            None => return false,
+        };
         if key < existing_key.as_slice() {
             insert_pos = i;
             break;
@@ -183,7 +186,10 @@ pub fn leaf_insert(page: &mut [u8; PAGE_SIZE], key: &[u8], rid: RID) -> bool {
 
     // Shift entries at [insert_pos..n) to the right by entry_size bytes.
     if insert_pos < n {
-        let shift_start = leaf_get_entry_offset(page, insert_pos as u16).unwrap();
+        let shift_start = match leaf_get_entry_offset(page, insert_pos as u16) {
+            Some(o) => o,
+            None => return false,
+        };
         // Byte range to shift: shift_start..used
         page.copy_within(shift_start..used, shift_start + entry_size);
     }
@@ -235,7 +241,10 @@ pub fn leaf_search(page: &[u8; PAGE_SIZE], key: &[u8]) -> Option<RID> {
     let mut hi: usize = n;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let mid_key = leaf_get_key(page, mid as u16).unwrap();
+        let mid_key = match leaf_get_key(page, mid as u16) {
+            Some(k) => k,
+            None => return None,
+        };
         match key.cmp(mid_key.as_slice()) {
             std::cmp::Ordering::Equal => return leaf_get_rid(page, mid as u16),
             std::cmp::Ordering::Less => hi = mid,
@@ -253,7 +262,10 @@ pub fn leaf_find_insert_pos(page: &[u8; PAGE_SIZE], key: &[u8]) -> usize {
     let mut hi: usize = n;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let mid_key = leaf_get_key(page, mid as u16).unwrap();
+        let mid_key = match leaf_get_key(page, mid as u16) {
+            Some(k) => k,
+            None => return lo,
+        };
         if key <= mid_key.as_slice() {
             hi = mid;
         } else {
@@ -273,7 +285,10 @@ pub fn leaf_delete(page: &mut [u8; PAGE_SIZE], key: &[u8]) -> bool {
     // Find the key.
     let mut found_idx: Option<usize> = None;
     for i in 0..n {
-        let k = leaf_get_key(page, i as u16).unwrap();
+        let k = match leaf_get_key(page, i as u16) {
+            Some(k) => k,
+            None => return false,
+        };
         if k.as_slice() == key {
             found_idx = Some(i);
             break;
@@ -285,7 +300,10 @@ pub fn leaf_delete(page: &mut [u8; PAGE_SIZE], key: &[u8]) -> bool {
         None => return false,
     };
 
-    let entry_off = leaf_get_entry_offset(page, idx as u16).unwrap();
+    let entry_off = match leaf_get_entry_offset(page, idx as u16) {
+        Some(o) => o,
+        None => return false,
+    };
     let key_len = read_u16(page, entry_off) as usize;
     let entry_size = 2 + key_len + 4 + 2;
     let used = leaf_used_bytes(page);
@@ -309,8 +327,14 @@ pub fn leaf_get_all_entries(page: &[u8; PAGE_SIZE]) -> Vec<(Vec<u8>, RID)> {
     let n = leaf_get_num_keys(page) as usize;
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
-        let key = leaf_get_key(page, i as u16).unwrap();
-        let rid = leaf_get_rid(page, i as u16).unwrap();
+        let key = match leaf_get_key(page, i as u16) {
+            Some(k) => k,
+            None => break,
+        };
+        let rid = match leaf_get_rid(page, i as u16) {
+            Some(r) => r,
+            None => break,
+        };
         entries.push((key, rid));
     }
     entries
@@ -387,7 +411,10 @@ pub fn internal_get_child(page: &[u8; PAGE_SIZE], index: u16) -> u32 {
         return internal_get_first_child(page);
     }
     // child at index i is stored after key at index i-1
-    let entry_off = internal_entry_offset(page, index - 1).unwrap();
+    let entry_off = match internal_entry_offset(page, index - 1) {
+        Some(o) => o,
+        None => return INVALID_PAGE_ID,
+    };
     let key_len = read_u16(page, entry_off) as usize;
     read_u32(page, entry_off + 2 + key_len)
 }
@@ -413,7 +440,10 @@ pub fn internal_insert(page: &mut [u8; PAGE_SIZE], key: &[u8], right_child: u32)
     // Find insertion position.
     let mut insert_pos: usize = n;
     for i in 0..n {
-        let existing_key = internal_get_key(page, i as u16).unwrap();
+        let existing_key = match internal_get_key(page, i as u16) {
+            Some(k) => k,
+            None => return false,
+        };
         if key < existing_key.as_slice() {
             insert_pos = i;
             break;
@@ -422,7 +452,10 @@ pub fn internal_insert(page: &mut [u8; PAGE_SIZE], key: &[u8], right_child: u32)
 
     // Shift entries at [insert_pos..n) to the right.
     if insert_pos < n {
-        let shift_start = internal_entry_offset(page, insert_pos as u16).unwrap();
+        let shift_start = match internal_entry_offset(page, insert_pos as u16) {
+            Some(o) => o,
+            None => return false,
+        };
         page.copy_within(shift_start..used, shift_start + entry_size);
     }
 
@@ -452,7 +485,10 @@ pub fn internal_insert(page: &mut [u8; PAGE_SIZE], key: &[u8], right_child: u32)
 pub fn internal_search_child(page: &[u8; PAGE_SIZE], key: &[u8]) -> u32 {
     let n = internal_get_num_keys(page) as usize;
     for i in 0..n {
-        let k = internal_get_key(page, i as u16).unwrap();
+        let k = match internal_get_key(page, i as u16) {
+            Some(k) => k,
+            None => break,
+        };
         if key < k.as_slice() {
             return internal_get_child(page, i as u16);
         }
@@ -474,7 +510,10 @@ pub fn internal_get_all_entries(page: &[u8; PAGE_SIZE]) -> Vec<(Vec<u8>, u32)> {
     let n = internal_get_num_keys(page) as usize;
     let mut entries = Vec::with_capacity(n);
     for i in 0..n {
-        let key = internal_get_key(page, i as u16).unwrap();
+        let key = match internal_get_key(page, i as u16) {
+            Some(k) => k,
+            None => break,
+        };
         let child = internal_get_child(page, (i + 1) as u16);
         entries.push((key, child));
     }

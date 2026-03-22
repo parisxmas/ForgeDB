@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
 use crate::database::Database;
+use crate::server::auth;
 use crate::tuple::types::Value;
 
 // ---------------------------------------------------------------------------
@@ -59,19 +61,31 @@ fn read_null_terminated_string(buf: &[u8], pos: &mut usize) -> String {
 pub struct MysqlServer {
     db_path: String,
     bind_addr: String,
+    /// Double-SHA1 of the root password, if set via FORGEDB_ROOT_PASSWORD env var.
+    /// If None, accept all connections (backward compatible).
+    root_password_hash: Option<[u8; 20]>,
 }
 
 impl MysqlServer {
     /// Create a new server instance.
     pub fn new(db_path: &str, bind_addr: &str) -> Self {
+        let root_password_hash = std::env::var("FORGEDB_ROOT_PASSWORD")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|p| auth::double_sha1(&p));
+
         Self {
             db_path: db_path.to_string(),
             bind_addr: bind_addr.to_string(),
+            root_password_hash,
         }
     }
 
+    /// Maximum concurrent connections. Beyond this, new connections are rejected.
+    const MAX_CONNECTIONS: u32 = 512;
+
     /// Start listening for connections. Blocks indefinitely.
-    /// Spawns a thread per connection, sharing a single Database via Arc<Mutex>.
+    /// Spawns a thread per connection, sharing a single Database via Arc.
     pub fn start(&self) -> io::Result<()> {
         let listener = TcpListener::bind(&self.bind_addr)?;
         println!("Server listening on {}", self.bind_addr);
@@ -83,24 +97,37 @@ impl MysqlServer {
         let db = Arc::new(db);
 
         let connection_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
+        let active_connections = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    // Enforce connection limit
+                    let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                    if current >= Self::MAX_CONNECTIONS {
+                        eprintln!("Connection limit reached ({}), rejecting", Self::MAX_CONNECTIONS);
+                        drop(stream);
+                        continue;
+                    }
+
                     let _ = stream.set_nodelay(true);
                     let conn_id = connection_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let db = Arc::clone(&db);
+                    let active = Arc::clone(&active_connections);
+                    active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let peer = stream
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
                     println!("New connection from {} (id={})", peer, conn_id);
 
+                    let pw_hash = self.root_password_hash;
                     thread::spawn(move || {
-                        let mut handler = match ConnectionHandler::new_shared(stream, db, conn_id) {
+                        let mut handler = match ConnectionHandler::new_shared(stream, db, conn_id, pw_hash) {
                             Ok(h) => h,
                             Err(e) => {
                                 eprintln!("Connection {} handler error: {}", conn_id, e);
+                                active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 return;
                             }
                         };
@@ -114,6 +141,7 @@ impl MysqlServer {
                             Err(_) => eprintln!("Connection {} panicked (recovered)", conn_id),
                         }
 
+                        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         println!("Connection {} closed", conn_id);
                     });
                 }
@@ -131,16 +159,30 @@ impl MysqlServer {
 // ConnectionHandler
 // ---------------------------------------------------------------------------
 
+/// A prepared statement cached on the server side.
+struct PreparedStatement {
+    sql: String,
+    param_count: u16,
+}
+
 struct ConnectionHandler {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
     db: Arc<Database>,
     connection_id: u32,
     seq_id: u8,
+    /// Stored password hash for authentication (None = accept all).
+    root_password_hash: Option<[u8; 20]>,
+    /// Prepared statements keyed by statement ID.
+    prepared_stmts: HashMap<u32, PreparedStatement>,
+    /// Next statement ID to assign.
+    next_stmt_id: u32,
+    /// Active session transaction (for multi-statement BEGIN/COMMIT/ROLLBACK).
+    current_txn_id: Option<crate::common::TxnId>,
 }
 
 impl ConnectionHandler {
-    fn new_shared(stream: TcpStream, db: Arc<Database>, connection_id: u32) -> io::Result<Self> {
+    fn new_shared(stream: TcpStream, db: Arc<Database>, connection_id: u32, root_password_hash: Option<[u8; 20]>) -> io::Result<Self> {
         let reader_stream = stream.try_clone()?;
         Ok(Self {
             reader: BufReader::with_capacity(8192, reader_stream),
@@ -148,6 +190,10 @@ impl ConnectionHandler {
             db,
             connection_id,
             seq_id: 0,
+            root_password_hash,
+            prepared_stmts: HashMap::new(),
+            next_stmt_id: 1,
+            current_txn_id: None,
         })
     }
 
@@ -228,6 +274,9 @@ impl ConnectionHandler {
         self.seq_id = 0;
         let mut greeting = Vec::with_capacity(128);
 
+        // Generate a 20-byte challenge
+        let challenge = auth::generate_challenge(self.connection_id);
+
         // protocol version
         greeting.push(0x0A);
 
@@ -237,18 +286,8 @@ impl ConnectionHandler {
         // connection id (4 bytes LE)
         greeting.extend_from_slice(&self.connection_id.to_le_bytes());
 
-        // auth_plugin_data_part1 (8 bytes) - deterministic from connection_id
-        let id_bytes = self.connection_id.to_le_bytes();
-        greeting.extend_from_slice(&[
-            id_bytes[0].wrapping_add(0x4A),
-            id_bytes[1].wrapping_add(0x2B),
-            id_bytes[2].wrapping_add(0x1C),
-            id_bytes[3].wrapping_add(0x3D),
-            0x5E,
-            0x6F,
-            0x70,
-            0x21,
-        ]);
+        // auth_plugin_data_part1 (first 8 bytes of challenge)
+        greeting.extend_from_slice(&challenge[0..8]);
 
         // filler
         greeting.push(0x00);
@@ -271,21 +310,8 @@ impl ConnectionHandler {
         // reserved (10 zero bytes)
         greeting.extend_from_slice(&[0x00; 10]);
 
-        // auth_plugin_data_part2 (12 bytes + NUL)
-        greeting.extend_from_slice(&[
-            id_bytes[0].wrapping_add(0x11),
-            id_bytes[1].wrapping_add(0x22),
-            id_bytes[2].wrapping_add(0x33),
-            id_bytes[3].wrapping_add(0x44),
-            0x55,
-            0x66,
-            0x77,
-            0x88,
-            0x99,
-            0xAA,
-            0xBB,
-            0xCC,
-        ]);
+        // auth_plugin_data_part2 (remaining 12 bytes of challenge + NUL)
+        greeting.extend_from_slice(&challenge[8..20]);
         greeting.push(0x00); // NUL terminator for auth_plugin_data_part2
 
         // auth_plugin_name (NUL-terminated)
@@ -309,7 +335,40 @@ impl ConnectionHandler {
         let username = read_null_terminated_string(&payload, &mut pos);
         println!("Client authenticated as: {}", username);
 
-        // Accept any password -- send OK with seq=2
+        // Extract auth response (length-encoded or fixed 20 bytes)
+        let auth_response = if pos < payload.len() {
+            let auth_len = payload[pos] as usize;
+            pos += 1;
+            if auth_len > 0 && pos + auth_len <= payload.len() {
+                Some(&payload[pos..pos + auth_len])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Validate password if configured
+        if let Some(stored_hash) = &self.root_password_hash {
+            let valid = match auth_response {
+                Some(response) => auth::validate_native_password(&challenge, response, stored_hash),
+                None => false, // No response but password required
+            };
+
+            if !valid {
+                self.seq_id = 2;
+                let err = Self::err_packet(1045, &format!("Access denied for user '{}'", username));
+                self.write_packet(&err)?;
+                self.flush()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Access denied for user '{}'", username),
+                ));
+            }
+        }
+        // If no password configured, accept all connections (backward compatible)
+
+        // Send OK
         self.seq_id = 2;
         let ok = Self::ok_packet(0, 0);
         self.write_packet(&ok)?;
@@ -519,6 +578,10 @@ impl ConnectionHandler {
         for val in row {
             match val {
                 Value::Null => pkt.push(0xFB),
+                Value::Boolean(b) => {
+                    // MySQL sends "1"/"0" for BIT/BOOLEAN, not "true"/"false"
+                    pkt.extend_from_slice(&encode_lenenc_str(if *b { "1" } else { "0" }));
+                }
                 other => {
                     let s = other.to_string();
                     pkt.extend_from_slice(&encode_lenenc_str(&s));
@@ -1008,6 +1071,35 @@ impl ConnectionHandler {
                     self.flush()?;
                 }
 
+                // COM_STMT_PREPARE
+                0x16 => {
+                    let sql = String::from_utf8_lossy(&payload[1..]).to_string();
+                    self.handle_stmt_prepare(&sql)?;
+                }
+
+                // COM_STMT_EXECUTE
+                0x17 => {
+                    self.handle_stmt_execute(&payload[1..])?;
+                }
+
+                // COM_STMT_CLOSE
+                0x19 => {
+                    if payload.len() >= 5 {
+                        let stmt_id = u32::from_le_bytes([
+                            payload[1], payload[2], payload[3], payload[4],
+                        ]);
+                        self.prepared_stmts.remove(&stmt_id);
+                    }
+                    // No response for COM_STMT_CLOSE
+                }
+
+                // COM_STMT_RESET
+                0x1A => {
+                    let ok = Self::ok_packet(0, 0);
+                    self.write_packet(&ok)?;
+                    self.flush()?;
+                }
+
                 // Unknown command
                 _ => {
                     let err = Self::err_packet(1047, &format!("Unknown command: {}", cmd));
@@ -1074,6 +1166,220 @@ impl ConnectionHandler {
         s
     }
 
+    /// Handle COM_STMT_PREPARE: parse SQL and return statement metadata.
+    fn handle_stmt_prepare(&mut self, sql: &str) -> io::Result<()> {
+        let param_count = sql.matches('?').count() as u16;
+        let stmt_id = self.next_stmt_id;
+        self.next_stmt_id += 1;
+
+        self.prepared_stmts.insert(
+            stmt_id,
+            PreparedStatement {
+                sql: sql.to_string(),
+                param_count,
+            },
+        );
+
+        // COM_STMT_PREPARE response:
+        // [status(1)=0x00][stmt_id(4)][num_columns(2)][num_params(2)][filler(1)][warning_count(2)]
+        let mut response = Vec::with_capacity(12);
+        response.push(0x00); // OK status
+        response.extend_from_slice(&stmt_id.to_le_bytes()); // statement_id
+        response.extend_from_slice(&0u16.to_le_bytes()); // num_columns (we'll send results as text)
+        response.extend_from_slice(&param_count.to_le_bytes()); // num_params
+        response.push(0x00); // filler
+        response.extend_from_slice(&0u16.to_le_bytes()); // warning_count
+
+        self.write_packet(&response)?;
+
+        // If there are parameters, send parameter column definitions + EOF
+        if param_count > 0 {
+            for _ in 0..param_count {
+                let col_def = self.build_param_column_definition();
+                self.write_packet(&col_def)?;
+            }
+            let eof = Self::eof_packet();
+            self.write_packet(&eof)?;
+        }
+
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Build a minimal column definition for a prepared statement parameter.
+    fn build_param_column_definition(&self) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(64);
+        pkt.extend_from_slice(&encode_lenenc_str("def"));
+        pkt.extend_from_slice(&encode_lenenc_str(""));
+        pkt.extend_from_slice(&encode_lenenc_str(""));
+        pkt.extend_from_slice(&encode_lenenc_str(""));
+        pkt.extend_from_slice(&encode_lenenc_str("?"));
+        pkt.extend_from_slice(&encode_lenenc_str(""));
+        pkt.push(0x0C); // fixed-length fields marker
+        pkt.extend_from_slice(&[0x21, 0x00]); // charset: utf8
+        pkt.extend_from_slice(&255u32.to_le_bytes()); // column length
+        pkt.push(0xFD); // type: VAR_STRING
+        pkt.extend_from_slice(&[0x00, 0x00]); // flags
+        pkt.push(0x00); // decimals
+        pkt.extend_from_slice(&[0x00, 0x00]); // filler
+        pkt
+    }
+
+    /// Handle COM_STMT_EXECUTE: read parameters, substitute into SQL, execute.
+    fn handle_stmt_execute(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.len() < 4 {
+            let err = Self::err_packet(1064, "invalid COM_STMT_EXECUTE packet");
+            self.write_packet(&err)?;
+            self.flush()?;
+            return Ok(());
+        }
+
+        let stmt_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+
+        let (sql, param_count) = match self.prepared_stmts.get(&stmt_id) {
+            Some(stmt) => (stmt.sql.clone(), stmt.param_count),
+            None => {
+                let err = Self::err_packet(1243, &format!("Unknown prepared statement id: {}", stmt_id));
+                self.write_packet(&err)?;
+                self.flush()?;
+                return Ok(());
+            }
+        };
+
+        // Read parameters from the binary protocol
+        let mut params = Vec::new();
+        if param_count > 0 && data.len() > 9 {
+            // Skip: flags(1) + iteration_count(4) = 5 bytes after stmt_id(4)
+            let mut offset = 4 + 1 + 4; // stmt_id already consumed from data start
+
+            // Skip NULL bitmap
+            let null_bitmap_len = (param_count as usize + 7) / 8;
+            let null_bitmap = if offset + null_bitmap_len <= data.len() {
+                let bm = &data[offset..offset + null_bitmap_len];
+                offset += null_bitmap_len;
+                bm.to_vec()
+            } else {
+                vec![0; null_bitmap_len]
+            };
+
+            // new_params_bound_flag
+            let new_params = if offset < data.len() {
+                let flag = data[offset];
+                offset += 1;
+                flag == 1
+            } else {
+                false
+            };
+
+            // Read type info if new params
+            let mut param_types = Vec::new();
+            if new_params {
+                for _ in 0..param_count {
+                    if offset + 2 <= data.len() {
+                        let type_byte = data[offset];
+                        let _flags = data[offset + 1];
+                        param_types.push(type_byte);
+                        offset += 2;
+                    } else {
+                        param_types.push(0xFD); // default to VAR_STRING
+                    }
+                }
+            } else {
+                for _ in 0..param_count {
+                    param_types.push(0xFD); // VAR_STRING
+                }
+            }
+
+            // Read parameter values
+            for i in 0..param_count as usize {
+                // Check null bitmap
+                if i < null_bitmap.len() * 8 && (null_bitmap[i / 8] & (1 << (i % 8))) != 0 {
+                    params.push("NULL".to_string());
+                    continue;
+                }
+
+                let val = match param_types.get(i).copied().unwrap_or(0xFD) {
+                    0x01 => { // TINY
+                        if offset < data.len() {
+                            let v = data[offset] as i8;
+                            offset += 1;
+                            v.to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
+                    0x02 | 0x03 => { // SHORT, LONG
+                        if offset + 4 <= data.len() {
+                            let v = i32::from_le_bytes([
+                                data[offset], data[offset + 1],
+                                data[offset + 2], data[offset + 3],
+                            ]);
+                            offset += 4;
+                            v.to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
+                    0x08 => { // LONGLONG
+                        if offset + 8 <= data.len() {
+                            let v = i64::from_le_bytes([
+                                data[offset], data[offset + 1],
+                                data[offset + 2], data[offset + 3],
+                                data[offset + 4], data[offset + 5],
+                                data[offset + 6], data[offset + 7],
+                            ]);
+                            offset += 8;
+                            v.to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
+                    0x05 => { // DOUBLE
+                        if offset + 8 <= data.len() {
+                            let v = f64::from_le_bytes([
+                                data[offset], data[offset + 1],
+                                data[offset + 2], data[offset + 3],
+                                data[offset + 4], data[offset + 5],
+                                data[offset + 6], data[offset + 7],
+                            ]);
+                            offset += 8;
+                            v.to_string()
+                        } else {
+                            "0".to_string()
+                        }
+                    }
+                    _ => { // VAR_STRING and others: length-encoded string
+                        if offset < data.len() {
+                            let str_len = data[offset] as usize;
+                            offset += 1;
+                            if offset + str_len <= data.len() {
+                                let s = String::from_utf8_lossy(&data[offset..offset + str_len]).to_string();
+                                offset += str_len;
+                                format!("'{}'", s.replace('\'', "''"))
+                            } else {
+                                "''".to_string()
+                            }
+                        } else {
+                            "''".to_string()
+                        }
+                    }
+                };
+                params.push(val);
+            }
+        }
+
+        // Substitute ? placeholders with parameter values
+        let mut final_sql = sql;
+        for param in params.iter().rev() {
+            if let Some(pos) = final_sql.rfind('?') {
+                final_sql.replace_range(pos..pos + 1, param);
+            }
+        }
+
+        // Execute via handle_query (text protocol results)
+        self.handle_query(&final_sql)
+    }
+
     /// Handle a COM_QUERY command.
     fn handle_query(&mut self, sql: &str) -> io::Result<()> {
         // Try interception first
@@ -1084,8 +1390,8 @@ impl ConnectionHandler {
         // Rewrite MySQL-specific SQL
         let rewritten = Self::rewrite_sql(sql);
 
-        // Forward to database engine
-        let __result = self.db.execute_sql(&rewritten);
+        // Forward to database engine with session transaction state
+        let __result = self.db.execute_sql_session(&rewritten, &mut self.current_txn_id);
                 match __result {
             Ok(result) => {
                 if result.columns.is_empty() {
@@ -1105,6 +1411,17 @@ impl ConnectionHandler {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for ConnectionHandler {
+    fn drop(&mut self) {
+        // Abort any open transaction on connection close
+        if let Some(txn_id) = self.current_txn_id.take() {
+            self.db.abort_transaction(txn_id);
+        }
+        // Clean up temp tables created by this connection
+        self.db.cleanup_temp_tables(self.connection_id);
     }
 }
 

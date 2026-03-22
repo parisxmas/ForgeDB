@@ -62,6 +62,12 @@ pub fn serialize(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
                     DataType::Boolean => Value::Boolean(false),
                     DataType::Varchar(_) => Value::Varchar(String::new()),
                     DataType::DateTime => Value::DateTime(0),
+                    DataType::Decimal(_, s) => Value::Decimal(0, s),
+                    DataType::Date => Value::Date(0),
+                    DataType::Time => Value::Time(0),
+                    DataType::VarBinary(_) => Value::Binary(vec![]),
+                    DataType::Json => Value::Json(String::new()),
+                    DataType::Uuid => Value::Uuid(String::new()),
                 }
             } else {
                 val.clone()
@@ -86,6 +92,22 @@ pub fn serialize(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
             (DataType::DateTime, Value::DateTime(_)) => {}
             (DataType::DateTime, Value::BigInt(_)) => {} // allow bigint in datetime col
             (DataType::DateTime, Value::Integer(_)) => {} // allow int in datetime col
+            // New types
+            (DataType::Decimal(_, _), Value::Decimal(_, _)) => {}
+            (DataType::Decimal(_, _), Value::Integer(_)) => {} // allow int in decimal col
+            (DataType::Decimal(_, _), Value::BigInt(_)) => {} // allow bigint in decimal col
+            (DataType::Decimal(_, _), Value::Float(_)) => {} // allow float in decimal col
+            (DataType::Date, Value::Date(_)) => {}
+            (DataType::Date, Value::DateTime(_)) => {} // allow datetime in date col
+            (DataType::Date, Value::Integer(_)) => {} // allow int in date col
+            (DataType::Time, Value::Time(_)) => {}
+            (DataType::Time, Value::Integer(_)) => {} // allow int in time col
+            (DataType::VarBinary(_), Value::Binary(_)) => {}
+            (DataType::VarBinary(_), Value::Varchar(_)) => {} // allow varchar in binary col
+            (DataType::Json, Value::Json(_)) => {}
+            (DataType::Json, Value::Varchar(_)) => {} // allow varchar in json col
+            (DataType::Uuid, Value::Uuid(_)) => {}
+            (DataType::Uuid, Value::Varchar(_)) => {} // allow varchar in uuid col
             _ => {
                 return Err(ForgeError::Tuple(format!(
                     "type mismatch for column {} ('{}'): schema expects {:?}, got {:?}",
@@ -123,19 +145,28 @@ pub fn serialize(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
             (Value::Float(v), _) => buf.extend_from_slice(&v.to_le_bytes()),
             (Value::Boolean(v), _) => buf.push(if *v { 1 } else { 0 }),
             (Value::DateTime(v), _) => buf.extend_from_slice(&v.to_le_bytes()),
+            (Value::Decimal(v, scale), _) => {
+                buf.extend_from_slice(&v.to_le_bytes());
+                buf.push(*scale);
+            }
+            (Value::Date(v), _) => buf.extend_from_slice(&v.to_le_bytes()),
+            (Value::Time(v), _) => buf.extend_from_slice(&v.to_le_bytes()),
             (Value::Varchar(_), _) => { /* handled in varchar section */ }
+            (Value::Binary(_), _) => { /* handled in varchar section as variable-length */ }
+            (Value::Json(_), _) => { /* handled in varchar section as variable-length */ }
+            (Value::Uuid(_), _) => { /* handled in varchar section as variable-length */ }
             (Value::Null, _) => unreachable!(),
         }
     }
 
     // --- varchar offset table + data ---
-    // Count varchar columns so we can pre-reserve space for the offset table.
+    // Count varchar-like columns (variable-length) so we can pre-reserve space.
     let varchar_cols: Vec<usize> = schema
         .columns
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            if matches!(c.data_type, DataType::Varchar(_)) {
+            if matches!(c.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
                 Some(i)
             } else {
                 None
@@ -156,16 +187,21 @@ pub fn serialize(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
                 // offset=0, length=0 (already zeroed)
                 continue;
             }
-            if let Value::Varchar(s) = val {
-                let data_offset = buf.len() as u16;
-                let data_len = s.len() as u16;
-                buf.extend_from_slice(s.as_bytes());
+            let (var_data, var_len) = match val {
+                Value::Varchar(s) => (s.as_bytes().to_vec(), s.len()),
+                Value::Json(s) => (s.as_bytes().to_vec(), s.len()),
+                Value::Uuid(s) => (s.as_bytes().to_vec(), s.len()),
+                Value::Binary(b) => (b.clone(), b.len()),
+                _ => continue,
+            };
+            let data_offset = buf.len() as u16;
+            let data_len = var_len as u16;
+            buf.extend_from_slice(&var_data);
 
-                // Patch offset table entry.
-                let entry_pos = offset_table_start + slot * 4;
-                buf[entry_pos..entry_pos + 2].copy_from_slice(&data_offset.to_le_bytes());
-                buf[entry_pos + 2..entry_pos + 4].copy_from_slice(&data_len.to_le_bytes());
-            }
+            // Patch offset table entry.
+            let entry_pos = offset_table_start + slot * 4;
+            buf[entry_pos..entry_pos + 2].copy_from_slice(&data_offset.to_le_bytes());
+            buf[entry_pos + 2..entry_pos + 4].copy_from_slice(&data_len.to_le_bytes());
         }
     }
 
@@ -208,7 +244,7 @@ pub fn deserialize(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            if matches!(c.data_type, DataType::Varchar(_)) {
+            if matches!(c.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
                 Some(i)
             } else {
                 None
@@ -218,7 +254,7 @@ pub fn deserialize(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
 
     // Read fixed fields.
     for (i, col) in schema.columns.iter().enumerate() {
-        if matches!(col.data_type, DataType::Varchar(_)) {
+        if matches!(col.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
             // placeholder – filled in below
             values.push(Value::Null);
             continue;
@@ -267,7 +303,32 @@ pub fn deserialize(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
                 values.push(Value::DateTime(v));
                 pos += 8;
             }
-            DataType::Varchar(_) => unreachable!(),
+            DataType::Decimal(_, _) => {
+                if pos + 9 > data.len() {
+                    return Err(ForgeError::Tuple("unexpected end of tuple (decimal)".into()));
+                }
+                let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let scale = data[pos + 8];
+                values.push(Value::Decimal(v, scale));
+                pos += 9;
+            }
+            DataType::Date => {
+                if pos + 4 > data.len() {
+                    return Err(ForgeError::Tuple("unexpected end of tuple (date)".into()));
+                }
+                let v = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                values.push(Value::Date(v));
+                pos += 4;
+            }
+            DataType::Time => {
+                if pos + 4 > data.len() {
+                    return Err(ForgeError::Tuple("unexpected end of tuple (time)".into()));
+                }
+                let v = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                values.push(Value::Time(v));
+                pos += 4;
+            }
+            DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid => unreachable!(),
         }
     }
 
@@ -296,13 +357,199 @@ pub fn deserialize(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
                     "varchar data extends beyond tuple boundary".into(),
                 ));
             }
-            let s = std::str::from_utf8(&data[offset..offset + length])
-                .map_err(|e| ForgeError::Tuple(format!("invalid utf-8 in varchar: {}", e)))?;
-            values[col_idx] = Value::Varchar(s.to_owned());
+            match schema.columns[col_idx].data_type {
+                DataType::VarBinary(_) => {
+                    values[col_idx] = Value::Binary(data[offset..offset + length].to_vec());
+                }
+                DataType::Json => {
+                    let s = std::str::from_utf8(&data[offset..offset + length])
+                        .map_err(|e| ForgeError::Tuple(format!("invalid utf-8 in json: {}", e)))?;
+                    values[col_idx] = Value::Json(s.to_owned());
+                }
+                DataType::Uuid => {
+                    let s = std::str::from_utf8(&data[offset..offset + length])
+                        .map_err(|e| ForgeError::Tuple(format!("invalid utf-8 in uuid: {}", e)))?;
+                    values[col_idx] = Value::Uuid(s.to_owned());
+                }
+                _ => {
+                    let s = std::str::from_utf8(&data[offset..offset + length])
+                        .map_err(|e| ForgeError::Tuple(format!("invalid utf-8 in varchar: {}", e)))?;
+                    values[col_idx] = Value::Varchar(s.to_owned());
+                }
+            }
         }
     }
 
     Ok(values)
+}
+
+/// Deserialize a single column from a binary tuple without deserializing
+/// all columns. Significantly faster when only one column value is needed
+/// (e.g., for SUM/AVG aggregates on a single column).
+///
+/// Returns `Value::Null` for null columns. Skips all other columns.
+pub fn deserialize_single_column(data: &[u8], schema: &Schema, target_col: usize) -> Result<Value> {
+    let ncols = schema.column_count();
+    if target_col >= ncols {
+        return Err(ForgeError::Tuple(format!(
+            "column index {} out of range ({})", target_col, ncols
+        )));
+    }
+    let bitmap_len = (ncols + 7) / 8;
+    if data.len() < bitmap_len {
+        return Err(ForgeError::Tuple("tuple data too short for null bitmap".into()));
+    }
+
+    // Check if target column is null
+    if data[target_col / 8] & (1 << (target_col % 8)) != 0 {
+        return Ok(Value::Null);
+    }
+
+    let target_type = &schema.columns[target_col].data_type;
+
+    // If the target is a variable-length type, we need to find the offset table
+    if matches!(target_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
+        // Count varchar columns before the target and compute the slot index
+        let mut varchar_slot = 0;
+        let mut pos = bitmap_len;
+        for (i, col) in schema.columns.iter().enumerate() {
+            if matches!(col.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
+                if i == target_col {
+                    // Found it — read from offset table at position `pos`
+                    // First, skip all fixed fields to find offset table start
+                    let mut fixed_pos = bitmap_len;
+                    for (j, c) in schema.columns.iter().enumerate() {
+                        if matches!(c.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
+                            continue;
+                        }
+                        if data[j / 8] & (1 << (j % 8)) != 0 {
+                            continue; // null
+                        }
+                        fixed_pos += fixed_field_size(&c.data_type);
+                    }
+                    // offset table starts at fixed_pos
+                    let entry_pos = fixed_pos + varchar_slot * 4;
+                    if entry_pos + 4 > data.len() {
+                        return Err(ForgeError::Tuple("unexpected end of tuple (varchar offset)".into()));
+                    }
+                    let offset = u16::from_le_bytes(data[entry_pos..entry_pos + 2].try_into().unwrap()) as usize;
+                    let length = u16::from_le_bytes(data[entry_pos + 2..entry_pos + 4].try_into().unwrap()) as usize;
+                    if offset + length > data.len() {
+                        return Err(ForgeError::Tuple("varchar data extends beyond tuple boundary".into()));
+                    }
+                    return match target_type {
+                        DataType::VarBinary(_) => Ok(Value::Binary(data[offset..offset + length].to_vec())),
+                        DataType::Json => {
+                            let s = std::str::from_utf8(&data[offset..offset + length])
+                                .map_err(|e| ForgeError::Tuple(format!("invalid utf-8: {}", e)))?;
+                            Ok(Value::Json(s.to_owned()))
+                        }
+                        DataType::Uuid => {
+                            let s = std::str::from_utf8(&data[offset..offset + length])
+                                .map_err(|e| ForgeError::Tuple(format!("invalid utf-8: {}", e)))?;
+                            Ok(Value::Uuid(s.to_owned()))
+                        }
+                        _ => {
+                            let s = std::str::from_utf8(&data[offset..offset + length])
+                                .map_err(|e| ForgeError::Tuple(format!("invalid utf-8: {}", e)))?;
+                            Ok(Value::Varchar(s.to_owned()))
+                        }
+                    };
+                }
+                varchar_slot += 1;
+            }
+        }
+        return Ok(Value::Null); // shouldn't reach here
+    }
+
+    // Fixed-size column: skip all preceding non-null fixed columns
+    let mut pos = bitmap_len;
+    for (i, col) in schema.columns.iter().enumerate() {
+        if matches!(col.data_type, DataType::Varchar(_) | DataType::VarBinary(_) | DataType::Json | DataType::Uuid) {
+            continue; // skip varchars in the fixed region
+        }
+        if i == target_col {
+            // Read the value at this position
+            return read_fixed_value(data, pos, target_type);
+        }
+        if data[i / 8] & (1 << (i % 8)) != 0 {
+            continue; // null — no bytes emitted
+        }
+        pos += fixed_field_size(&col.data_type);
+    }
+
+    Ok(Value::Null)
+}
+
+#[inline]
+fn fixed_field_size(dt: &DataType) -> usize {
+    match dt {
+        DataType::Integer => 4,
+        DataType::BigInt => 8,
+        DataType::Float => 8,
+        DataType::Boolean => 1,
+        DataType::DateTime => 8,
+        DataType::Decimal(_, _) => 9,
+        DataType::Date => 4,
+        DataType::Time => 4,
+        _ => 0,
+    }
+}
+
+fn read_fixed_value(data: &[u8], pos: usize, dt: &DataType) -> Result<Value> {
+    match dt {
+        DataType::Integer => {
+            if pos + 4 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::Integer(i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap())))
+        }
+        DataType::BigInt => {
+            if pos + 8 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::BigInt(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())))
+        }
+        DataType::Float => {
+            if pos + 8 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::Float(f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())))
+        }
+        DataType::Boolean => {
+            if pos + 1 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::Boolean(data[pos] != 0))
+        }
+        DataType::DateTime => {
+            if pos + 8 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::DateTime(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())))
+        }
+        DataType::Decimal(_, _) => {
+            if pos + 9 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let scale = data[pos + 8];
+            Ok(Value::Decimal(v, scale))
+        }
+        DataType::Date => {
+            if pos + 4 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::Date(i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap())))
+        }
+        DataType::Time => {
+            if pos + 4 > data.len() {
+                return Err(ForgeError::Tuple("unexpected end of tuple".into()));
+            }
+            Ok(Value::Time(i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap())))
+        }
+        _ => Ok(Value::Null),
+    }
 }
 
 /// Coerce a value to match the expected column type.
@@ -349,6 +596,56 @@ fn coerce_value(val: &Value, target: &DataType) -> Value {
         (Value::Varchar(s), DataType::DateTime) => {
             Value::DateTime(parse_datetime_string(s))
         }
+        // Integer -> Decimal
+        (Value::Integer(n), DataType::Decimal(_, scale)) => {
+            Value::Decimal((*n as i64) * 10i64.pow(*scale as u32), *scale)
+        }
+        // BigInt -> Decimal
+        (Value::BigInt(n), DataType::Decimal(_, scale)) => {
+            Value::Decimal(*n * 10i64.pow(*scale as u32), *scale)
+        }
+        // Float -> Decimal
+        (Value::Float(f), DataType::Decimal(_, scale)) => {
+            let factor = 10f64.powi(*scale as i32);
+            Value::Decimal((*f * factor).round() as i64, *scale)
+        }
+        // Varchar -> Decimal
+        (Value::Varchar(s), DataType::Decimal(_, scale)) => {
+            if let Ok(f) = s.parse::<f64>() {
+                let factor = 10f64.powi(*scale as i32);
+                Value::Decimal((f * factor).round() as i64, *scale)
+            } else {
+                Value::Decimal(0, *scale)
+            }
+        }
+        // DateTime -> Date (extract date part)
+        (Value::DateTime(e), DataType::Date) => {
+            Value::Date((*e / 86400) as i32)
+        }
+        // Varchar -> Date
+        (Value::Varchar(s), DataType::Date) => {
+            let epoch = parse_datetime_string(s);
+            Value::Date((epoch / 86400) as i32)
+        }
+        // Varchar -> Time
+        (Value::Varchar(s), DataType::Time) => {
+            // Parse HH:MM:SS
+            let parts: Vec<&str> = s.split(':').collect();
+            let h: i32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+            let m: i32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+            let sec: i32 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+            Value::Time(h * 3600 + m * 60 + sec)
+        }
+        // Integer -> Date
+        (Value::Integer(n), DataType::Date) => Value::Date(*n),
+        // Integer -> Time
+        (Value::Integer(n), DataType::Time) => Value::Time(*n),
+        // Varchar -> Json
+        (Value::Varchar(s), DataType::Json) => Value::Json(s.clone()),
+        // Varchar -> Uuid
+        (Value::Varchar(s), DataType::Uuid) => Value::Uuid(s.clone()),
+        // Varchar -> Binary
+        (Value::Varchar(s), DataType::VarBinary(_)) => Value::Binary(s.as_bytes().to_vec()),
         // Otherwise keep as-is
         _ => val.clone(),
     }
@@ -413,6 +710,8 @@ mod tests {
                     auto_increment: false,
                     default_value: None,
                     is_primary_key: false,
+                    is_unique: false,
+                    check_expr: None, fk_ref: None,
                 })
                 .collect(),
         )

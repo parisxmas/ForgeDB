@@ -19,6 +19,72 @@ impl TableIterator {
         }
     }
 
+    /// Collect all page IDs in the linked list starting from the first page.
+    /// This traverses the page chain reading only headers, not tuple data.
+    pub fn collect_page_ids(
+        first_page_id: PageId,
+        bpm: &mut LocalBpm,
+    ) -> Result<Vec<PageId>> {
+        let mut page_ids = Vec::new();
+        let mut current = first_page_id;
+
+        loop {
+            if current.0 == INVALID_PAGE_ID {
+                break;
+            }
+
+            bpm.fetch_page(current)?;
+            page_ids.push(current);
+
+            let next_pid = {
+                let page = bpm.get_page(current);
+                heap_page::get_next_page_id(&page.data)
+            };
+            bpm.unpin_page(current, false)?;
+
+            current = PageId(next_pid);
+        }
+
+        Ok(page_ids)
+    }
+
+    /// Scan tuples only from a specific set of page IDs.
+    /// This is used by parallel scan to process a chunk of pages.
+    pub fn scan_pages(
+        page_ids: &[PageId],
+        bpm: &mut LocalBpm,
+    ) -> Result<Vec<(RID, Vec<u8>)>> {
+        let mut results = Vec::new();
+
+        for &page_id in page_ids {
+            bpm.fetch_page(page_id)?;
+
+            let num_slots = {
+                let page = bpm.get_page(page_id);
+                heap_page::get_num_slots(&page.data)
+            };
+
+            for slot_id in 0..num_slots {
+                let tuple_data = {
+                    let page = bpm.get_page(page_id);
+                    heap_page::get_tuple(&page.data, slot_id)
+                };
+
+                if let Some(data) = tuple_data {
+                    let rid = RID {
+                        page_id,
+                        slot_id,
+                    };
+                    results.push((rid, data));
+                }
+            }
+
+            bpm.unpin_page(page_id, false)?;
+        }
+
+        Ok(results)
+    }
+
     /// Advance the iterator, returning the next `(RID, tuple_data)` pair, or
     /// `None` when all tuples have been visited.
     pub fn next(

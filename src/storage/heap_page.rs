@@ -109,6 +109,25 @@ fn set_slot(page: &mut [u8; PAGE_SIZE], slot_id: u16, offset: u16, length: u16) 
     page[base + 3] = len_bytes[1];
 }
 
+// ── Fast-path counters ────────────────────────────────────────────
+
+/// Count the number of live (non-deleted) tuple slots in a page WITHOUT
+/// reading any tuple data. This is used by the COUNT(*) fast path to avoid
+/// deserializing or allocating Vec<u8> per tuple.
+///
+/// A slot is considered deleted when its offset is 0.
+pub fn count_live_tuples(page: &[u8; PAGE_SIZE]) -> u16 {
+    let num_slots = get_num_slots(page);
+    let mut live = 0u16;
+    for slot_id in 0..num_slots {
+        let (offset, _length) = get_slot(page, slot_id);
+        if offset != 0 {
+            live += 1;
+        }
+    }
+    live
+}
+
 // ── Public API ─────────────────────────────────────────────────────
 
 /// Amount of free space available for new tuples (including the overhead of a
@@ -182,6 +201,21 @@ pub fn get_tuple(page: &[u8; PAGE_SIZE], slot_id: u16) -> Option<Vec<u8>> {
     let start = offset as usize;
     let end = start + length as usize;
     Some(page[start..end].to_vec())
+}
+
+/// Return (offset, length) of the tuple in the given slot without allocating.
+/// Returns `None` if the slot is out of range or has been deleted.
+/// The caller can then borrow `&page[offset..offset+length]` directly.
+pub fn get_tuple_slice(page: &[u8; PAGE_SIZE], slot_id: u16) -> Option<(usize, usize)> {
+    let num_slots = get_num_slots(page);
+    if slot_id >= num_slots {
+        return None;
+    }
+    let (offset, length) = get_slot(page, slot_id);
+    if offset == 0 {
+        return None;
+    }
+    Some((offset as usize, length as usize))
 }
 
 /// Delete the tuple in the given slot. Returns `true` if the slot existed and
