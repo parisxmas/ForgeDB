@@ -492,6 +492,33 @@ fn extract_equi_join_key_indices(
 
 /// Execute a read-only plan using borrowed (not cloned) catalog and indexes.
 pub fn execute_read(plan: PlanNode, ctx: &mut ReadContext) -> Result<ExecuteResult> {
+    // ── Volcano iterator fast path ────────────────────────────────────
+    // Try to build a pull-based iterator pipeline for this plan.
+    // This avoids materializing intermediate Vec<(RID, Vec<Value>)> between
+    // ── COUNT(*) fast path (highest priority) ───────────────────────
+    // Must run BEFORE the volcano iterator to avoid per-tuple overhead.
+    if let PlanNode::Projection { ref columns, ref child } = plan {
+        if let Some(fast_result) = try_count_star_fast(columns, child, ctx) {
+            return fast_result;
+        }
+    }
+
+    // ── Volcano iterator fast path ────────────────────────────────
+    // Streaming execution: pull one tuple at a time through the pipeline.
+    // If the plan contains unsupported nodes (JOINs, IndexScan,
+    // clustered-index tables), returns None and falls through.
+    {
+        let cbpm = ctx.bpm.get_cbpm();
+        if let Some(iter_result) = super::iterator::try_build_iterator(
+            &plan, ctx.catalog, cbpm, ctx.clustered_indexes, ctx.txn_ctx.as_ref(),
+        ) {
+            match iter_result {
+                Ok(mut iter) => return super::iterator::drain_iterator(iter.as_mut()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     match plan {
         PlanNode::Limit { count, offset, child } => {
             // LIMIT pushdown: if child is a bare scan (no sort), pass the limit

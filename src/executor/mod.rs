@@ -10,6 +10,7 @@ pub mod grace_hash_join;
 pub mod hash_join;
 pub mod index_scan;
 pub mod insert;
+pub mod iterator;
 pub mod nested_loop_join;
 pub mod projection;
 pub mod seq_scan;
